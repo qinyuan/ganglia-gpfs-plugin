@@ -1,0 +1,2095 @@
+#!/usr/bin/perl516
+
+use 5.16.0;
+use English;
+use FileHandle;
+use Fcntl qw(:flock :seek);
+use File::stat;
+use FindBin;
+use Getopt::Long;
+use IO::String;
+use Log::Syslog::Fast ':all';
+use Pod::Usage;
+use Socket;
+use Sys::Hostname;
+use Ganglia::Gmetric::XS;
+use DBI qw(:sql_types);
+
+our $debug = 0;
+
+use lib "$FindBin::Bin/../lib";
+use Utility;
+use MonitorDB;
+use MonitorDB::Entry;
+use MonitorDB::FS;
+use MonitorDB::Hosts;
+use MonitorDB::Waiter;
+
+use strict qw(vars refs subs);
+
+sub STATE_REPORT () { 0 }
+sub STATE_TRACK  () { 1 }
+sub NSTATES      () { 2 }
+
+################################################################################
+#
+# PARAMETERS
+#
+# Parameters defined using "my" are not modifiable by a config file due to the
+# behavior of the "do" statement that imports the config file.  Parameters
+# defined using "our" are modifiable by the config file.
+#
+################################################################################
+my $configFile;
+my $defaultConfigFile = '/etc/gpfsreporter.conf';
+my $gpfsreporterRevision = '20131213';
+my $secsPerStep = 5;
+my $secsPerCycle = $secsPerStep * NSTATES;
+my $usageVerbosity;
+
+our $dbHost;
+our $dbName;
+our $dbPassword;
+our $dbPort;
+our $dbUser;
+our $dumpsDir = '/root/logs/gpfsmonitor';
+our $expelledList = '/root/gpfs/glade/expelled';
+our $ganglia = 1;
+our $gmDmax = 0; # no expiration
+our $gmTmax = $secsPerCycle;
+our $gmondConf = '/etc/ganglia/gmond.conf.gpfsmonitor';
+our $hostname = hostname;
+our $html = 1;
+our $htmlMaxAge = $secsPerCycle;
+our $htmlReportCSS = 'report.css';
+our $htmlReportPath = '/var/www/html/gpfs/report.html';
+our $htmlReportSorter = 'sorttable.js';
+our $htmlReportTitle = 'GPFS Monitor Report';
+our $manual = 0;
+our $lockFile = '/var/run/gpfsreporter';
+our $lockout = 1;
+our $logFile = '/var/log/gpfsreporter';
+our $reportIntroParagraph = 'The report introduction paragraph was not customized.';
+our $syslog = 0;
+our $tooltipMaxLen = 80;
+our $tooltipMaxNodes = 8;
+our $trace = 0;
+
+Getopt::Long::Configure('noignore_case', 'pass_through');
+GetOptions(
+        'config:s' => \$configFile,
+        'debug!' => \$debug,
+        'help' => sub { $usageVerbosity = 1; },
+        'man' => sub { $usageVerbosity = 2; },
+        'version' => sub { print "$PROGRAM_NAME version: $gpfsreporterRevision\n"; exit(EXIT_SUCCESS); },
+        ) || pod2usage(EXIT_BADOPT);
+
+pod2usage(-exitstatus => 0, -verbose => $usageVerbosity) if ($usageVerbosity);
+
+################################################################################
+#
+# DB Queries
+#
+################################################################################
+
+sub DBFatal ($$)
+{
+	my $h = shift;
+	my $msg = shift;
+
+	Fatal($msg . ': ' . $h->errstr);
+}
+
+my $awolQ;
+my $blockerQ;
+my $dumpCurrentQ;
+my $dumpFSstateQ;
+my $dumpHstateQ;
+my $gpfsStateQ;
+my $maxCurrentTSQ;
+my $mountStatsQ;
+my $populateCurrentQ;
+my $populateWaitersQ;
+my $reportAgeQ;
+my $trackStateQ;
+my $truncateCurrentQ;
+my $waiterDepsQ;
+my $waiterStatsQ;
+my $waiterTnameQ;
+
+sub PrepareQueries ($)
+{
+	my $dbh = shift;
+	my $stmt;
+
+	$stmt = $dbh->prepare(q{
+			CREATE TEMP TABLE current (like current);
+			CREATE TEMP TABLE waiters (like waiters) ON COMMIT DELETE ROWS;
+			CREATE TEMP TABLE deps OF wd ON COMMIT DELETE ROWS;
+			CREATE INDEX ON deps(host_id);
+			CREATE TEMP TABLE hstate (like hstate);
+			CREATE TEMP TABLE fsstate (like fsstate);
+			})
+		|| DBFatal($dbh, 'prepare temp tables create');
+
+	$stmt->execute() || DBFatal($stmt, 'current temp tables create');
+	$stmt->finish();
+
+	$stmt = $dbh->prepare(q{
+			WITH q AS (
+				SELECT ts, host_id
+				FROM entry
+				WHERE ts > statement_timestamp() - interval '7 days'
+				ORDER by ts DESC
+			)
+			INSERT INTO hstate
+				SELECT DISTINCT ON (host_id)
+					ts, host_id, NULL, NULL, NULL
+				FROM q
+				ORDER by host_id, ts DESC;
+			})
+		|| DBFatal($dbh, 'prepopulate hstate table');
+
+	$stmt->execute() || DBFatal($stmt, 'prepopulate hstate table');
+	$stmt->finish();
+
+	$populateCurrentQ = $dbh->prepare(q{
+			INSERT INTO current
+				SELECT DISTINCT ON (e.host_id)
+					c.id, e.*
+				FROM
+					clusters c, entry e, hosts h
+				WHERE
+					e.host_id = h.id AND h.cluster_id = c.id AND
+					ts > statement_timestamp() - interval '10 minutes'
+				ORDER BY
+					e.host_id, e.ts DESC;
+			})
+		|| DBFatal($dbh, 'prepare populate current table');
+
+	$populateWaitersQ = $dbh->prepare(q{
+			INSERT INTO waiters
+				SELECT cluster_id, host_id, unnest(waiters) AS waiter
+				FROM current
+				UNION
+				SELECT clusters.id AS cluster_id, NULL, NULL FROM clusters;
+			})
+		|| DBFatal($dbh, 'prepare populate waiters table');
+
+	$reportAgeQ = $dbh->prepare(q{
+			WITH
+			recent AS (
+				SELECT DISTINCT ON (host_id)
+					host_id,
+					extract('epoch' FROM age(statement_timestamp(), ts)) AS age
+				FROM entry
+				WHERE ts > statement_timestamp() - interval '1 day'
+				ORDER BY host_id, ts DESC
+			),
+			backfill AS (
+				SELECT
+					host_id,
+					extract('epoch' FROM age(statement_timestamp(), hs.ts)) AS age
+				FROM hstate hs NATURAL RIGHT JOIN hosts h (host_id) WHERE host_id NOT IN (SELECT host_id FROM recent)
+			),
+			q AS (
+				SELECT * FROM recent
+				UNION
+				SELECT * FROM backfill
+			)
+			SELECT	cl.name as "cluster",
+				cl.known_nodes AS "known",
+				count(CASE WHEN q.age <@ doublerange(0, 600) THEN TRUE END) AS "[0m, 10m)",
+				count(CASE WHEN q.age <@ doublerange(600, 3600) THEN TRUE END) AS "[10m, 60m)",
+				string_agg(CASE WHEN q.age <@ doublerange(600, 3600) THEN h.name::text END, ',') AS "TT3",
+				count(CASE WHEN q.age <@ doublerange(3600, 21600) THEN TRUE END) AS "[1h, 6h)",
+				string_agg(CASE WHEN q.age <@ doublerange(3600, 21600) THEN h.name::text END, ',') AS "TT4",
+				count(CASE WHEN q.age <@ doublerange(21600, 86400) THEN TRUE END) AS "[6h, 24h)",
+				string_agg(CASE WHEN q.age <@ doublerange(21600, 86400) THEN h.name::text END, ',') AS "TT5",
+				count(CASE WHEN q.age <@ doublerange(86400, 'Infinity', '[]') THEN TRUE END) AS "[1d, &infin;]",
+				string_agg(CASE WHEN q.age <@ doublerange(86400, 'Infinity', '[]') THEN h.name::text END, ',') AS "TT6",
+				count(CASE WHEN q.age < 0 THEN TRUE END) AS "future",
+				string_agg(CASE WHEN q.age < 0 THEN h.name::text END, ',') AS "TT7",
+				count(CASE WHEN q.age IS NULL THEN TRUE END) AS "no data",
+				string_agg(CASE WHEN q.age IS NULL THEN h.name::text END, ',') AS "TT8"
+			FROM q, clusters as cl, hosts h
+			WHERE q.host_id = h.id AND h.cluster_id = cl.id
+			GROUP BY cl.name, cl.known_nodes
+			ORDER BY cl.name;
+			})
+		|| DBFatal($dbh, 'prepare report age');
+
+	$gpfsStateQ = $dbh->prepare(q{
+			SELECT	cl.name as "cluster",
+				cl.known_nodes AS "known",
+				count(c.host_id) AS "reporting",
+				count(CASE WHEN c.state = 'active' THEN TRUE END) AS "active",
+				count(CASE WHEN c.state = 'arbitrating' THEN TRUE END) AS "arbitrating",
+				string_agg(CASE WHEN c.state = 'arbitrating' THEN h.name::text END, ',') AS "TT4",
+				count(CASE WHEN c.state = 'initializing' THEN TRUE END) AS "initializing",
+				string_agg(CASE WHEN c.state = 'initializing' THEN h.name::text END, ',') AS "TT5",
+				count(CASE WHEN c.state = 'down' THEN TRUE END) AS "down",
+				string_agg(CASE WHEN c.state = 'down' THEN h.name::text END, ',') AS "TT6",
+				count(CASE WHEN c.state = 'broken' THEN TRUE END) AS "broken",
+				string_agg(CASE WHEN c.state = 'broken' THEN h.name::text END, ',') AS "TT7",
+				cl.known_nodes - count(c.host_id) + count(CASE WHEN c.state = 'unknown' THEN TRUE END) AS "unknown",
+				string_agg(CASE WHEN c.state = 'unknown' THEN h.name::text END, ',') AS "TT8",
+				count(array_upper(c.run_errors, 1)) AS "gpfsmond errors",
+				string_agg(CASE WHEN array_upper(c.run_errors, 1) > 0 THEN h.name::text END, ',') AS "TT8",
+				count(CASE WHEN c.rdma_enabled = false THEN TRUE END) AS "rdma anomaly"
+			FROM current AS c RIGHT JOIN clusters AS cl ON c.cluster_id = cl.id, hosts AS h
+			WHERE cl.known_nodes IS NOT NULL AND c.host_id = h.id
+			GROUP BY cl.name, cl.known_nodes
+			ORDER BY cl.name;
+			})
+		|| DBFatal($dbh, 'prepare report age');
+
+
+	$mountStatsQ = $dbh->prepare(q{
+				WITH q AS (
+					SELECT cluster_id, host_id, unnest(file_systems) AS fs FROM current
+				)
+				SELECT  cl.name as "cluster",
+					f.gpfs_dev_name as "file system",
+					cl.known_nodes AS "known",
+					count(CASE WHEN (fs).mounted THEN TRUE END) AS "mounted",
+					count(CASE WHEN (fs).usability = 'ok' THEN TRUE END) AS "accessible",
+					count(CASE WHEN (fs).usability = 'stale' THEN TRUE END) AS "stale",
+					string_agg(CASE WHEN (fs).usability = 'stale' THEN h.name::text END, ',') AS "TT6",
+					count(CASE WHEN (fs).usability = 'nodev' THEN TRUE END) AS "nodev",
+					string_agg(CASE WHEN (fs).usability = 'nodev' THEN h.name::text END, ',') AS "TT7",
+					count(CASE WHEN (fs).usability = 'no' THEN TRUE END) AS "unusable",
+					string_agg(CASE WHEN (fs).usability = 'no' THEN h.name::text END, ',') AS "TT8",
+					count(CASE WHEN (fs).usability = 'error' THEN TRUE END) AS "error",
+					string_agg(CASE WHEN (fs).usability = 'error' THEN h.name::text END, ',') AS "TT9",
+					count(CASE WHEN (fs).remount_status THEN TRUE END) AS "remount success",
+					count(CASE WHEN (fs).remount_status = false THEN TRUE END) AS "remount fail",
+					cl.known_nodes - count(DISTINCT q.host_id) AS "unknown"
+				FROM
+					q, clusters AS cl, file_systems AS f, hosts AS h
+				WHERE
+					q.cluster_id = cl.id AND (q.fs).fs_id = f.id AND q.host_id = h.id
+				GROUP BY cl.name, cl.known_nodes, f.gpfs_dev_name
+				ORDER BY cl.name, f.gpfs_dev_name;
+			})
+		|| DBFatal($dbh, 'prepare mount stats');
+
+	$waiterDepsQ = $dbh->prepare(q{
+			SELECT name AS node, max_secs, max_chain_len, blockers, deadlocks FROM wdview() ORDER BY node;
+			})
+		|| DBFatal($dbh, 'prepare waiter deps');
+
+	$waiterStatsQ = $dbh->prepare(q{
+			SELECT	cl.name as "cluster",
+				count(distinct host_id) AS "nodes waiting",
+				count(waiter) AS "threads waiting",
+				count(CASE WHEN (waiter).secs <@ realrange(0, 60) THEN TRUE END) AS "[0, 1m)",
+				count(CASE WHEN (waiter).secs <@ realrange(60, 300) THEN TRUE END) AS "[1m, 5m)",
+				count(CASE WHEN (waiter).secs <@ realrange(300, 1200) THEN TRUE END) AS "[5m, 20m)",
+				count(CASE WHEN (waiter).secs <@ realrange(1200, 3600) THEN TRUE END) AS "[20m, 60m)",
+				count(CASE WHEN (waiter).secs <@ realrange(3600, 'Infinity', '[]') THEN TRUE END) AS "[1h, &infin;]",
+				min((waiter).secs) AS "min secs", max((waiter).secs) AS "max secs"
+			FROM waiters AS w, clusters AS cl
+			WHERE w.cluster_id = cl.id
+			GROUP BY cl.name
+			ORDER BY cl.name;
+			})
+		|| DBFatal($dbh, 'prepare waiter stats');
+
+	$blockerQ = $dbh->prepare(q{SELECT node, blocked_nodes FROM blocker_view();})
+		|| DBFatal($dbh, 'prepare blocker stats');
+
+        $waiterTnameQ = $dbh->prepare(q{
+                        SELECT  count(*) AS instances,
+                                t.name AS "thread name",
+                                r.str AS "reason"
+                        FROM waiters AS w, waiter_reason_strs AS r, waiter_tnames AS t
+                        WHERE
+                                (w.waiter).reason_id = r.id AND (w.waiter).tname_id = t.id
+                        GROUP BY
+                                t.name, r.str
+                        ORDER BY
+                                instances;
+                        })
+		|| DBFatal($dbh, 'prepare waiter tname/reason stats');
+
+	$awolQ = $dbh->prepare(q{
+			WITH awol AS (
+				SELECT id AS host_id FROM hosts
+				EXCEPT
+				SELECT host_id FROM current
+			)
+			SELECT
+				c.name AS cluster, h.name AS node
+			FROM
+				hosts AS h, clusters AS c, awol
+			WHERE
+				h.id = awol.host_id AND h.cluster_id = c.id
+			ORDER BY
+				c.name, h.name;
+			})
+		|| DBFatal($dbh, 'prepare awol');
+
+	$maxCurrentTSQ = $dbh->prepare(q{SELECT max(ts) FROM current;})
+		|| DBFatal($dbh, 'prepare max current ts');
+
+	$truncateCurrentQ = $dbh->prepare(q{TRUNCATE current;})
+		|| DBFatal($dbh, 'prepare truncate current ts');
+
+	$trackStateQ = $dbh->prepare(q{SELECT ts, node, msg FROM track_state($1);})
+		|| DBFatal($dbh, 'prepare track_state');
+
+	$dumpCurrentQ = $dbh->prepare(q{
+                        SELECT
+                                c.ts, h.name, c.state, c.rdma_enabled, c.verbs_ports, 
+                                array_upper(c.file_systems, 1) AS "nFS",
+                                array_upper(c.waiters, 1) AS "nWaiters",
+                                array_upper(c.run_errors, 1) AS "nRunErrors",
+                                c.mounts_ok
+                        FROM
+                                current AS c, hosts AS h
+			WHERE
+				c.host_id = h.id
+                        ORDER BY
+                                c.ts;
+                        })
+		|| DBFatal($dbh, 'prepare dump current');
+
+	$dumpHstateQ = $dbh->prepare(q{
+			SELECT
+				s.ts, h.name, s.state, s.rdma_enabled, s.verbs_ports, s.mounts_ok
+			FROM
+				hstate AS s, hosts AS h
+			WHERE
+				s.host_id = h.id
+			ORDER BY
+				h.name;
+			})
+		|| DBFatal($dbh, 'prepare dump hstate');
+
+	$dumpFSstateQ = $dbh->prepare(q{
+			SELECT
+				s.ts, h.name, f.gpfs_dev_name, s.mounted, s.usability, s.remount_enabled
+			FROM
+				fsstate AS s, hosts AS h, file_systems AS f
+			WHERE
+				s.host_id = h.id AND s.fs_id = f.id
+			ORDER BY
+				h.name, f.gpfs_dev_name;
+			})
+		|| DBFatal($dbh, 'prepare dump fsstate');
+}
+
+################################################################################
+#
+# Ganglia Support
+#
+################################################################################
+
+my $gmond;
+my $nodeCountMetric = [0, {type => 'int16', units => 'nodes', tmax => $gmTmax, dmax => $gmDmax}];
+my %pseudoIPAddr;
+my $secondsMetric = [0, {type => 'double', units => 'seconds', tmax => $gmTmax, dmax => $gmDmax}];
+
+sub MetricName ($)
+{
+	my $r = shift;
+
+	return($r->[0]);
+}
+
+sub MetricTmplDefault ($)
+{
+	my $r = shift;
+
+	return($r->[1]->[0]);
+}
+
+sub MetricTmplAttrs ($)
+{
+	my $r = shift;
+
+	return($r->[1]->[1]);
+}
+
+
+sub GangliaSendHeartbeats ()
+{
+        foreach my $k (keys %pseudoIPAddr) {
+                $gmond->heartbeat(spoof => SpoofHost($k));
+        }
+}
+
+sub MetricSend ($@)
+{
+        return if (!$ganglia);
+
+	my $gmond = shift;
+	my %args = @_;
+
+	if ($debug) {
+		foreach my $k (sort keys %args) {
+			print "$k: $args{$k} ";
+		}
+
+		print "\n";
+		return;
+	}
+
+	$gmond->send(%args) || Fatal("gmond->send failed");
+}
+
+sub RegisterClusterPseudoIP (@)
+{
+        my $k;
+        my $v;
+
+        while (($k, $v) = splice(@_, 0, 2)) {
+                $pseudoIPAddr{$k} = $v;
+        }
+}
+
+sub SpoofHost ($)
+{
+	my $c = shift;
+        my $a = $pseudoIPAddr{$c};
+
+        Fatal("(Ganglia metrics): no pseudoIP defined for cluster '$c'") unless (defined($a));
+
+	#
+	# gmond is lower casing host names, but the web interface gets confused
+	# and can't find the stats...
+	#
+	$a . ':' . lc($c);
+}
+
+sub GenFSMetrics ($$$$)
+{
+	my $qs = shift;
+	my $rows = shift;
+	my $metrics = shift;
+	my $gmond = shift;
+	my $i;
+	my $nCols = $qs->{NUM_OF_FIELDS};
+	my $colNames = $qs->{NAME};
+	my $colTypes = $qs->{TYPE};
+	my $clusterCol;
+	my $fsCol;
+	my $v;
+
+	for ($i = 0; $i < $nCols; $i++) {
+		$clusterCol = $i if ($colNames->[$i] eq 'cluster');
+		$fsCol = $i if ($colNames->[$i] eq 'file system');
+	}
+
+	for (my $n = 0; $n < @{$rows}; $n++) {
+		my $row = $rows->[$n];
+		my $c = $row->[$clusterCol];
+		my $f = $row->[$fsCol];
+		my $spoof = SpoofHost($c);
+
+		for ($i = 0; $i < $nCols; $i++) {
+			next if ($i == $clusterCol);
+			next if ($i == $fsCol);
+			my $m = $metrics->{$colNames->[$i]};
+			next if (!defined($m));
+			if (!defined($v = $row->[$i])) {
+				$v = MetricTmplDefault($m);
+			}
+
+			my $n = MetricName($m);
+			$n =~ s/%/$f/;
+			MetricSend($gmond, spoof => $spoof, name => $n, value => $v, %{MetricTmplAttrs($m)});
+		}
+	}
+}
+
+sub GenMetrics ($$$$;$)
+{
+	my $qs = shift;
+	my $rows = shift;
+	my $metrics = shift;
+	my $gmond = shift;
+	my $fakeLoadOne = shift;
+	my $i;
+	my $nCols = $qs->{NUM_OF_FIELDS};
+	my $colNames = $qs->{NAME};
+	my $colTypes = $qs->{TYPE};
+	my $clusterCol;
+	my $v;
+
+	for ($i = 0; $i < $nCols; $i++) {
+		if ($colNames->[$i] eq 'cluster') {
+			$clusterCol = $i;
+			last;
+		}
+	}
+
+	for (my $n = 0; $n < @{$rows}; $n++) {
+		my $row = $rows->[$n];
+		my $c = $row->[$clusterCol];
+		my $spoof = SpoofHost($c);
+
+		for ($i = 0; $i < $nCols; $i++) {
+			next if ($i == $clusterCol);
+			my $m = $metrics->{$colNames->[$i]};
+			next if (!defined($m));
+			if (!defined($v = $row->[$i])) {
+				$v = MetricTmplDefault($m);
+			}
+
+			MetricSend($gmond, spoof => $spoof, name => MetricName($m), value => $v,
+					%{MetricTmplAttrs($m)});
+		}
+
+		if (defined($fakeLoadOne)) {
+			MetricSend($gmond, spoof => $spoof, name => 'load_one', value => '0.00',
+					type => 'float', units => ' ', tmax => $gmTmax, dmax => $gmDmax);
+		}
+	}
+}
+
+################################################################################
+#
+# HTML Report Support
+#
+################################################################################
+
+sub ColumnNumeric ($)
+{
+	my $t = shift;
+
+	return(1) if (
+			($t == SQL_BIGINT) ||
+			($t == SQL_DECIMAL) ||
+			($t == SQL_DOUBLE) ||
+			($t == SQL_FLOAT) ||
+			($t == SQL_INTEGER) ||
+			($t == SQL_NUMERIC) ||
+			($t == SQL_REAL) ||
+			($t == SQL_SMALLINT) ||
+			($t == SQL_TINYINT)
+		);
+
+	return(0);
+}
+
+sub ColumnAlignment ($)
+{
+	my $t = shift;
+
+	return(ColumnNumeric($t) ? "right" : "left");
+}
+
+sub GenTableRows ($$$;$)
+{
+	my $qs = shift;
+	my $rows = shift;
+	my $content = shift;
+	my $attrsRef = shift;
+	my $i;
+	my $nCols = $qs->{NUM_OF_FIELDS};
+	my $colNames = $qs->{NAME};
+	my $colTypes = $qs->{TYPE};
+	my @ca;
+	my @ah;
+	my $ah;
+
+	$content->print("  <tr>\n");
+	for ($i = 0; $i < $nCols; $i++) {
+		my $n = $colNames->[$i];
+
+		$ca[$i] = ColumnAlignment($colTypes->[$i]);
+		if (defined($attrsRef)) {
+			if (defined($ah = $attrsRef->{$n})) {
+				$ah[$i] = $ah;
+				if (defined($ah->{'ttnc'})) {
+					$i++;
+				}
+			}
+		}
+
+		$content->print(qq{    <th align="center">$n</th>\n});
+	}
+
+	$content->print("  </tr>\n");
+
+	for (my $n = 0; $n < @{$rows}; $n++) {
+		my $row = $rows->[$n];
+		$content->print("  <tr>\n");
+		for ($i = 0; $i < $nCols; $i++) {
+			my $v = $row->[$i] // '&nbsp;';
+			if (ref($v) eq "ARRAY") {
+				$v = join(',', @{$v});
+			}
+
+			my $attrs = qq{align="$ca[$i]"};
+
+			if (defined($ah = $ah[$i])) {
+				my $t;
+
+				if (
+					($v > 0) && ColumnNumeric($colTypes->[$i]) &&
+					defined($t = $ah->{'class'})
+				) {
+					$attrs .= qq{ class="$t"};
+				}
+
+				if (defined($ah->{'ttnc'})) {
+					$i++;
+					if (defined($t = $row->[$i])) {
+						if (ref($t) eq "ARRAY") {
+							my @t = sort {$a cmp $b} @{$t}[0..$tooltipMaxNodes - 1];
+							$t = join(',', @t);
+							$t .= ' …' if (@#{$t} >= $tooltipMaxNodes);
+						}
+
+						if (length($t) > 0) {
+							if (length($t) >= $tooltipMaxLen) {
+								$t = substr($t, 0, $tooltipMaxLen - 1) . ' …';
+							}
+
+							$attrs .= qq{ title="$t"}
+						}
+					}
+				}
+			}
+
+			$content->print(qq{    <td $attrs>$v</td>\n});
+		}
+
+		$content->print("  </tr>\n");
+	}
+}
+
+sub GenTableGroupedRows ($$$)
+{
+	my $qs = shift;
+	my $rows = shift;
+	my $content = shift;
+	my $i;
+	my @ca;
+	my $nCols = $qs->{NUM_OF_FIELDS};
+
+	Fatal("GenTableGroupedRows can only handle two columns!") if ($nCols != 2);
+
+	my $colNames = $qs->{NAME};
+	my $colTypes = $qs->{TYPE};
+
+	$content->print("  <tr>\n");
+	for ($i = 0; $i < $nCols; $i++) {
+		$ca[$i] = ColumnAlignment($colTypes->[$i]);
+		$content->print(qq{    <th align="center">$colNames->[$i]</th>\n});
+	}
+
+	$content->print("  </tr>\n");
+	return if (@{$rows} == 0);
+
+	my $group = '';
+	my $vals = '';
+
+	for (my $n = 0; $n < @{$rows}; $n++) {
+		my $row = $rows->[$n];
+
+		if ($row->[0] ne $group) {
+			if ($vals ne '') {
+				$content->print(qq{    <td>$vals</td>\n});
+				$content->print("  </tr>\n");
+			}
+
+			$group = $row->[0];
+			$content->print("  <tr>\n");
+			$content->print(qq{    <td align="$ca[0]">$group</td>\n});
+			$vals = '';
+		}
+
+		my $v = $row->[1] // '&nbsp;';
+
+		$vals .= ' ' if ($vals ne '');
+		if (ref($v) eq "ARRAY") {
+			$vals .= join(' ', @{$v});
+
+		} else {
+			$vals .= $v;
+		}
+	}
+
+	if ($vals ne '') {
+		$content->print(qq{    <td>$vals</td>\n});
+		$content->print("  </tr>\n");
+	}
+}
+
+sub StdTableFooter ($)
+{
+	my $content = shift;
+
+	$content->print(qq{</table>\n});
+}
+
+sub StdTableHeader ($;@)
+{
+	my $content = shift;
+	my $attrs = join(' ', @_);
+
+	$content->print(qq{<table border="1" cellpadding="4" cellspacing="0" class="sortable" $attrs>\n});
+}
+
+################################################################################
+#
+################################################################################
+
+sub DBErrorHtml ($$$)
+{
+	my $h = shift;
+	my $content = shift;
+	my $msg = shift;
+
+	$content->print(
+qq{<p>DATABASE ERROR: $msg</p>
+<p>SQL error code: $h->err</p>
+<p>$h->errstr</p>
+});
+}
+
+my %stateMetrics = (
+	'reporting'	=> ['gm_nodes_reporting', $nodeCountMetric],
+	'active'	=> ['gm_state_active', $nodeCountMetric],
+	'arbitrating'	=> ['gm_state_arbitrating', $nodeCountMetric],
+	'initializing'	=> ['gm_state_initializing', $nodeCountMetric],
+	'down'		=> ['gm_state_down', $nodeCountMetric],
+        'broken'        => ['gm_state_broken', $nodeCountMetric],
+	'gpfsmond errors' => ['gm_nodes_monerrs', $nodeCountMetric],
+	'rdma anomaly'	=> ['gm_nodes_rdma', $nodeCountMetric],
+	'unknown'	=> ['gm_state_unknown', $nodeCountMetric],
+);
+
+my %stateAttrs = (
+	'arbitrating'	=> { 'class' => 'gmstarb', 'ttnc' => 1, },
+	'initializing'	=> { 'class' => 'gmstini', 'ttnc' => 1, },
+	'down'		=> { 'class' => 'gmstdwn', 'ttnc' => 1, },
+        'broken'        => { 'class' => 'gmstbkn', 'ttnc' => 1, },
+        'rdma anomaly'  => { 'class' => 'gmstra', 'ttnc' => 1, },
+	'gpfsmond errors' => { 'class' => 'gmsterr', 'ttnc' => 1, },
+	'unknown'	=> { 'class' => 'gmstunk', 'ttnc' => 1, },
+);
+
+sub GPFSState ($$$)
+{
+	my $dbh = shift;
+	my $content = shift;
+	my $gmond = shift;
+
+	$content->print("<h2>GPFS状态</h2>\n");
+	$gpfsStateQ->execute();
+	if ($gpfsStateQ->err) {
+		DBErrorHtml($gpfsStateQ, $content, 'GPSF state query');
+		return;
+	}
+
+	my $rows = $gpfsStateQ->fetchall_arrayref;
+	if ($gpfsStateQ->err) {
+		DBErrorHtml($gpfsStateQ, $content, 'GPSF state rows fetch');
+		return;
+	}
+
+	StdTableHeader($content);
+	GenTableRows($gpfsStateQ, $rows, $content, \%stateAttrs);
+	StdTableFooter($content);
+	GenMetrics($gpfsStateQ, $rows, \%stateMetrics, $gmond, 1);
+}
+
+my %mountMetrics = (
+	'accessible'	=> [ 'gm_%_mounted_accessible', $nodeCountMetric],
+	'stale'		=> [ 'gm_%_mounted_stale', $nodeCountMetric],
+	'nodev'		=> [ 'gm_%_unmounted_nodev', $nodeCountMetric],
+	'unusable'	=> [ 'gm_%_unmounted_unusable', $nodeCountMetric],
+	'error'		=> [ 'gm_%_unmounted_error', $nodeCountMetric],
+	'remount success' => [ 'gm_%_remount_success', $nodeCountMetric],
+	'remount fail'	=> [ 'gm_%_remount_failure', $nodeCountMetric],
+	'unknown'	=> [ 'gm_%_unknown', $nodeCountMetric],
+);
+
+my %mountAttrs = (
+	'stale'		=> { 'class' => 'gmmstl', 'ttnc' => 1, },
+	'nodev'		=> { 'class' => 'gmmnod', 'ttnc' => 1, },
+	'unusable'	=> { 'class' => 'gmmunu', 'ttnc' => 1, },
+	'error'		=> { 'class' => 'gmmerr', 'ttnc' => 1, },
+	'remount success' => { 'class' => 'gmrms', },
+	'remount fail'	=> { 'class' => 'gmrmf', },
+	'unknown'	=> { 'class' => 'gmmunk', },
+);
+
+sub MountStats ($$$)
+{
+	my $dbh = shift;
+	my $content = shift;
+	my $gmond = shift;
+
+	$content->print("<h2>文件系统挂载统计</h2>\n");
+	$mountStatsQ->execute();
+	if ($mountStatsQ->err) {
+		DBErrorHtml($mountStatsQ, $content, 'mount stats query');
+		return;
+	}
+
+	my $rows = $mountStatsQ->fetchall_arrayref;
+	if ($mountStatsQ->err) {
+		DBErrorHtml($mountStatsQ, $content, 'mount stats rows fetch');
+		return;
+	}
+
+	StdTableHeader($content);
+	GenTableRows($mountStatsQ, $rows, $content, \%mountAttrs);
+	StdTableFooter($content);
+	GenFSMetrics($mountStatsQ, $rows, \%mountMetrics, $gmond);
+}
+
+my %ageMetrics = (
+	'known'		=> [ 'gm_nodes_known', $nodeCountMetric],
+	'[0m, 10m)'	=> [ 'gm_rptage_0m_10m', $nodeCountMetric],
+	'[10m, 60m)'	=> [ 'gm_rptage_10m_60m', $nodeCountMetric],
+	'[1h, 6h)'	=> [ 'gm_rptage_1h_6h', $nodeCountMetric],
+	'[6h, 24h)'	=> [ 'gm_rptage_6h_24h', $nodeCountMetric],
+	'[1d, &infin;]'	=> [ 'gm_rptage_1d_inf', $nodeCountMetric],
+	'no data'	=> [ 'gm_rptage_never', $nodeCountMetric],
+	'future'	=> [ 'gm_rptage_future', $nodeCountMetric],
+);
+
+my %ageAttrs = (
+	'[10m, 60m)'	=> { 'class' => 'gmra10m', 'ttnc' => 1 },
+	'[1h, 6h)'	=> { 'class' => 'gmra1h', 'ttnc' => 1 },
+	'[6h, 24h)'	=> { 'class' => 'gmra6h', 'ttnc' => 1 },
+	'[1d, &infin;]'	=> { 'class' => 'gmra1d', 'ttnc' => 1 },
+	'no data'	=> { 'class' => 'gmrand', 'ttnc' => 1 },
+	'future'	=> { 'class' => 'gmrafut', 'ttnc' => 1 },
+);
+
+sub NodeReportAge ($$$)
+{
+	my $dbh = shift;
+	my $content = shift;
+	my $gmond = shift;
+
+	$content->print(
+qq{<h2>节点最后一次上报的时间</h2>
+<p>注：“no data”系列包括那些7天内没有上报的节点，以及上报时间早于数据库中保留的最早一条日志记录的节点。</p>
+});
+	$reportAgeQ->execute();
+	if ($reportAgeQ->err) {
+		DBErrorHtml($reportAgeQ, $content, 'report age query');
+		return;
+	}
+
+	my $rows = $reportAgeQ->fetchall_arrayref;
+	if ($reportAgeQ->err) {
+		DBErrorHtml($reportAgeQ, $content, 'report age rows fetch');
+		return;
+	}
+
+	StdTableHeader($content);
+	GenTableRows($reportAgeQ, $rows, $content, \%ageAttrs);
+	StdTableFooter($content);
+	GenMetrics($reportAgeQ, $rows, \%ageMetrics, $gmond);
+}
+
+sub WaiterDeps ($$)
+{
+	my $dbh = shift;
+	my $content = shift;
+
+	$content->print("<h2>Waiter依赖关系</h2>\n");
+	$waiterDepsQ->execute();
+	if ($waiterDepsQ->err) {
+		DBErrorHtml($waiterDepsQ, $content, 'waiter deps query');
+		return;
+	}
+
+	my $rows = $waiterDepsQ->fetchall_arrayref;
+	if ($waiterDepsQ->err) {
+		DBErrorHtml($waiterDepsQ, $content, 'waiter deps rows fetch');
+		return;
+	}
+
+	StdTableHeader($content);
+	GenTableRows($waiterDepsQ, $rows, $content);
+	StdTableFooter($content);
+}
+
+sub BlockerCounts ($$)
+{
+	my $dbh = shift;
+	my $content = shift;
+
+	$content->print("<h2>Blocking节点汇总</h2>\n");
+	$blockerQ->execute();
+	if ($blockerQ->err) {
+		DBErrorHtml($blockerQ, $content, 'blocker counts query');
+		return;
+	}
+
+	my $rows = $blockerQ->fetchall_arrayref;
+	if ($blockerQ->err) {
+		DBErrorHtml($blockerQ, $content, 'blocker counts rows fetch');
+		return;
+	}
+
+	StdTableHeader($content);
+	GenTableRows($blockerQ, $rows, $content);
+	StdTableFooter($content);
+}
+
+sub WaiterTnameCounts ($$)
+{
+	my $dbh = shift;
+	my $content = shift;
+
+	$content->print("<h2>Waiter Thread/Reason汇总</h2>\n");
+	$waiterTnameQ->execute();
+	if ($waiterTnameQ->err) {
+		DBErrorHtml($waiterTnameQ, $content, 'waiter tname/reason counts query');
+		return;
+	}
+
+	my $rows = $waiterTnameQ->fetchall_arrayref;
+	if ($waiterTnameQ->err) {
+		DBErrorHtml($waiterTnameQ, $content, 'waiter tname/reasonounts rows fetch');
+		return;
+	}
+
+	StdTableHeader($content);
+	GenTableRows($waiterTnameQ, $rows, $content);
+	StdTableFooter($content);
+}
+
+my %waiterMetrics = (
+	'nodes waiting'	=> [ 'gm_waiter_nodes', $nodeCountMetric],
+	'threads waiting' => [ 'gm_waiter_threads', $nodeCountMetric],
+	'[0, 1m)'	=> [ 'gm_waiter_0_1m', $nodeCountMetric],
+	'[1m, 5m)'	=> [ 'gm_waiter_1m_5m', $nodeCountMetric],
+	'[5m, 20m)'	=> [ 'gm_waiter_5m_20m', $nodeCountMetric],
+	'[20m, 60m)'	=> [ 'gm_waiter_20m_60m', $nodeCountMetric],
+	'[1h, &infin;]'	=> [ 'gm_waiter_1h_inf', $nodeCountMetric],
+	'min secs'	=> [ 'gm_waiter_min_secs', $secondsMetric],
+	'max secs'	=> [ 'gm_waiter_max_secs', $secondsMetric],
+);
+
+my %waiterAttrs = (
+	'[1m, 5m)'	=> { 'class' => 'gmwa1m', },
+	'[5m, 20m)'	=> { 'class' => 'gmwa5m', },
+	'[20m, 60m)'	=> { 'class' => 'gmwa20m', },
+	'[1h, &infin;]'	=> { 'class' => 'gmwa1h', },
+);
+
+sub WaiterStats ($$$)
+{
+	my $dbh = shift;
+	my $content = shift;
+	my $gmond = shift;
+
+	$content->print(
+q{<h2>Waiter统计</h2>
+<p>当前仅追踪&ge;10秒的Waiter</p>
+});
+	$waiterStatsQ->execute();
+	if ($waiterStatsQ->err) {
+		DBErrorHtml($waiterStatsQ, $content, 'waiter stats query');
+		return;
+	}
+
+	my $rows = $waiterStatsQ->fetchall_arrayref;
+	if ($waiterStatsQ->err) {
+		DBErrorHtml($waiterStatsQ, $content, 'waiter stats rows fetch');
+		return;
+	}
+
+	StdTableHeader($content);
+	GenTableRows($waiterStatsQ, $rows, $content, \%waiterAttrs);
+	StdTableFooter($content);
+	GenMetrics($waiterStatsQ, $rows, \%waiterMetrics, $gmond);
+}
+
+sub AwolNodes ($$)
+{
+	my $dbh = shift;
+	my $content = shift;
+
+	$content->print("<h2>故障节点</h2>\n");
+	$awolQ->execute();
+	if ($awolQ->err) {
+		DBErrorHtml($awolQ, $content, 'awol nodes query');
+		return;
+	}
+
+	my $rows = $awolQ->fetchall_arrayref;
+	if ($awolQ->err) {
+		DBErrorHtml($awolQ, $content, 'awol nodes rows fetch');
+		return;
+	}
+
+	StdTableHeader($content, 'width="100%"');
+	$content->print(qq{  <colgroup><col width="0*"><col></colgroup>\n});
+	GenTableGroupedRows($awolQ, $rows, $content);
+	StdTableFooter($content);
+}
+
+sub ExpelledNodes ($$)
+{
+	my $dbh = shift;
+	my $content = shift;
+
+	return unless (open(E, $expelledList));
+
+	my @nodes;
+	while (my $l = <E>) {
+		if ($l =~ /^\d+\.\d+\.\d+\.\d+\s+\(([^ ]+)/) {
+			my $h = $1;
+			$h =~ s/-ib//;
+			push(@nodes, $h);
+		}	
+	}
+
+	close(E);
+	$content->print("<h2>被移除的节点</h2>\n");
+	StdTableHeader($content, 'width="100%"');
+	$content->print(qq{<tr>\n  <th align="center">nodes</th>\n</tr>\n<tr>\n  <td>});
+	foreach my $n (sort {$a cmp $b} @nodes) {
+		$content->print($n . ' ');
+	}
+
+	$content->print("</td>\n</tr>\n");
+	StdTableFooter($content);
+}
+
+sub ProcessReports ($$$)
+{
+	my $dbh = shift;
+	my $content = shift;
+	my $gmond = shift;
+	my $sec;
+	my $min;
+	my $hour;
+	my $mday;
+	my $mon;
+	my $year;
+	my $start = time();
+	
+	($sec, $min, $hour, $mday, $mon, $year) = (localtime($start))[0..5];
+	my $date = sprintf("%04d/%02d/%02d %02d:%02d:%02d", $year + 1900, $mon + 1, $mday, $hour, $min, $sec);
+
+	if ($dbh->{AutoCommit}) {
+		$dbh->begin_work || DBFatal($dbh, 'begin work');
+	}
+
+	$populateCurrentQ->execute() || DBFatal($populateCurrentQ, 'execute populate current');
+	$populateWaitersQ->execute() || DBFatal($populateWaitersQ, 'execute populate waiters');
+	$content->print(
+qq{<html>
+<head>
+<title>$htmlReportTitle</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<meta http-equiv="Cache-Control" content="max-age=$htmlMaxAge">
+<link type="text/css" href="$htmlReportCSS" rel="stylesheet" />
+<script src="$htmlReportSorter"></script>
+</head>
+<body>
+<h1>$htmlReportTitle</h1>
+<p>报告时间：$date</p>
+$reportIntroParagraph
+<p>如果想对表格中某一列对表格数据进行排序，可单击该列的表头。对于表格中某些的异常值，将鼠标移动到该数字上即显示对应的节点名称</p>
+});
+	NodeReportAge($dbh, $content, $gmond);
+	GPFSState($dbh, $content, $gmond);
+	WaiterStats($dbh, $content, $gmond);
+	WaiterDeps($dbh, $content);
+	BlockerCounts($dbh, $content);
+        WaiterTnameCounts($dbh, $content);
+	MountStats($dbh, $content, $gmond);
+	AwolNodes($dbh, $content);
+	ExpelledNodes($dbh, $content);
+
+	my $rt = "<p>报告生成时间：" . (time() - $start) . " 秒。</p>\n";
+	$content->print($rt);
+	$content->print("</body>\n</html>\n");
+	$dbh->commit || DBFatal($dbh, 'commit');
+}
+
+sub DumpCurrent ($)
+{
+	my $dbh = shift;
+        my $fh;
+	my $ts;
+	my $host;
+        my $state;
+        my $rdma_enabled;
+        my $verbs_ports;
+        my $nFS;
+        my $nWaiters;
+        my $nRunErrors;
+        my $mounts_ok;
+
+        if ($debug) {
+                $fh = FileHandle->new_from_fd(fileno(STDOUT), ">");
+
+        } else {
+                my @a = localtime;
+                my $n = sprintf("$dumpsDir/current.%04d%02d%02d-%02d%02d%02d", $a[5] + 1900, $a[4] + 1, $a[3],
+                                $a[2], $a[1], $a[0]);
+                $fh = FileHandle->new(">$n");
+        }
+
+	$dumpCurrentQ->execute();
+	$dumpCurrentQ->bind_columns(\$ts, \$host, \$state, \$rdma_enabled, \$verbs_ports, \$nFS, \$nWaiters,
+                                        \$nRunErrors, \$mounts_ok);
+	print $fh "#ts,host,state,rdma_enabled,verbs_ports,nFS,nWaiters,nRunErrors,mounts_ok\n";
+	while ($dumpCurrentQ->fetch) {
+		print $fh "$ts,$host,$state,$rdma_enabled,$verbs_ports,$nFS,$nWaiters,$nRunErrors,$mounts_ok\n";
+	}
+
+        $fh->close;
+	DBFatal($dumpCurrentQ, 'fetch rows') if ($dumpCurrentQ->err);
+}
+
+my $latestEntryTS = 0;
+
+sub DumpFSstate ($)
+{
+	my $dbh = shift;
+	my $fh;
+	my $ts;
+	my $host;
+        my $fs;
+        my $mounted;
+        my $usability;
+        my $remount_enabled;
+
+        if ($debug) {
+                $fh = FileHandle->new_from_fd(fileno(STDOUT), ">");
+
+        } else {
+                my @a = localtime;
+                my $n = sprintf("$dumpsDir/fsstate.%04d%02d%02d-%02d%02d%02d", $a[5] + 1900, $a[4] + 1, $a[3],
+                                $a[2], $a[1], $a[0]);
+                $fh = FileHandle->new(">$n");
+        }
+
+	$dumpFSstateQ->execute();
+	$dumpFSstateQ->bind_columns(\$ts, \$host, \$fs, \$mounted, \$usability, \$remount_enabled);
+	print $fh "#ts,host,file_system,mounted,usability,remount_enabled\n";
+	while ($dumpFSstateQ->fetch) {
+		print $fh "$ts,$host,$fs,$mounted,$usability,$remount_enabled\n";
+	}
+
+	$fh->close;
+	DBFatal($dumpFSstateQ, 'fetch rows') if ($dumpFSstateQ->err);
+}
+
+sub DumpHstate ($)
+{
+	my $dbh = shift;
+	my $fh;
+	my $ts;
+	my $host;
+        my $state;
+        my $rdma_enabled;
+        my $verbs_ports;
+        my $mounts_ok;
+
+        if ($debug) {
+                $fh = FileHandle->new_from_fd(fileno(STDOUT), ">");
+
+        } else {
+                my @a = localtime;
+                my $n = sprintf("$dumpsDir/hstate.%04d%02d%02d-%02d%02d%02d", $a[5] + 1900, $a[4] + 1, $a[3],
+                                $a[2], $a[1], $a[0]);
+                $fh = FileHandle->new(">$n");
+        }
+
+	$dumpHstateQ->execute();
+	$dumpHstateQ->bind_columns(\$ts, \$host, \$state, \$rdma_enabled, \$verbs_ports, \$mounts_ok);
+	print $fh "#ts,host,state,rdma_enabled,verbs_ports,mounts_ok\n";
+	while ($dumpHstateQ->fetch) {
+		print $fh "$ts,$host,$state,$rdma_enabled,$verbs_ports,$mounts_ok\n";
+	}
+
+	$fh->close;
+	DBFatal($dumpHstateQ, 'fetch rows') if ($dumpHstateQ->err);
+}
+
+################################################################################
+#
+# Syslog Support
+#
+################################################################################
+
+my $localLogger;
+
+sub LocalLoggerOpen ()
+{
+	$localLogger = Log::Syslog::Fast->new(LOG_UDP, 'localhost', 514, LOG_LOCAL1, LOG_INFO, '', 'GPFS MONITOR');
+	Fatal("Could not initialize syslog connection") unless ($localLogger);
+}
+
+my $ssgLogger;
+
+sub SsgLoggerOpen ()
+{
+	# SSG firewalls do not allow access to syslog port via IB IF, use external one.
+        my $ssgLoggerHost = ($hostname eq 'glademgt1') ? 'ysadmin1-ib' : 'jsmgt1.ucar.edu';
+
+	$ssgLogger = Log::Syslog::Fast->new(LOG_UDP, $ssgLoggerHost, 514, LOG_LOCAL1, LOG_INFO, '', 'GPFS MONITOR');
+	Fatal("Could not initialize syslog connection") unless ($ssgLogger);
+}
+
+sub LogOpen ()
+{
+        return unless ($syslog);
+        LocalLoggerOpen();
+        SsgLoggerOpen();
+}
+
+sub LogSend ($$)
+{
+        my $node = shift;
+        my $msg = "$node: " . shift;
+
+        Debug($msg) if ($debug);
+        return unless($syslog);
+
+        my $tries = 2;
+        do {
+                eval {$localLogger->send($msg)};
+                if ($@) {
+                        $tries--;
+                        LocalLoggerOpen();
+
+                } else {
+                        $tries = 0;
+                }
+        } while ($tries > 0);
+
+        next if ((substr($node, 0, 5) eq 'glade') || (substr($node, 0, 3) eq 'nsd'));
+        next if ((substr($node, 0, 6) eq 'picnic') || (substr($node, 0, 4) eq 'tnsd'));
+
+        $tries = 2;
+        do {
+                eval {$ssgLogger->send($msg)};
+                if ($@) {
+                        $tries--;
+                        SsgLoggerOpen();
+
+                } else {
+                        $tries = 0;
+                }
+        } while ($tries > 0);
+}
+
+################################################################################
+#
+# STATE TRACKING
+#
+################################################################################
+
+sub TrackState ($)
+{
+	my $dbh = shift;
+	my $ts;
+	my $node;
+	my $msg;
+
+	if ($latestEntryTS > 0) {
+		$trackStateQ->execute($latestEntryTS) || DBFatal($trackStateQ, 'track state query');
+		$trackStateQ->bind_columns(\$ts, \$node, \$msg);
+		while ($a = $trackStateQ->fetch) {
+                        LogSend($node, $msg);
+		}
+
+		if ($trackStateQ->err) {
+			DBFatal($trackStateQ, 'track state row fetch');
+		}
+	}
+
+	$maxCurrentTSQ->execute();
+	if ($maxCurrentTSQ->err) {
+		DBFatal($maxCurrentTSQ, 'max current ts query');
+	}
+
+	if ($maxCurrentTSQ->rows > 0) {
+		my $ts;
+		$maxCurrentTSQ->bind_columns(\$ts);
+		if ($maxCurrentTSQ->fetch) {
+			$latestEntryTS = $ts if (defined($ts));
+
+		} elsif ($maxCurrentTSQ->err) {
+			DBFatal($maxCurrentTSQ, 'max current ts fetch');
+		}
+
+	} else {
+		print STDERR "Unable to get max(ts) from current\n";
+		$latestEntryTS = 0;
+	}
+
+	$truncateCurrentQ->execute() || DBFatal($truncateCurrentQ, 'truncate current query');
+}
+
+################################################################################
+#
+# MAIN ROUTINE
+#
+################################################################################
+
+ReadConfig($configFile, $defaultConfigFile);
+
+Getopt::Long::Configure('default', 'nopass_through');
+GetOptions(
+        'db-host:s' => \$dbHost,
+        'db-name:s' => \$dbName,
+        'db-password:s' => \$dbPassword,
+        'db-port:s' => \$dbPort,
+        'db-user:s' => \$dbUser,
+        'debug!' => \$debug,
+        'dumps-dir:s' => \$dumpsDir,
+        'expelled-list:s' => \$expelledList,
+        'ganglia!' => \$ganglia,
+        'gm-dmax:i' => \$gmDmax,
+        'gm-tmax:i' => \$gmTmax,
+        'gmond-conf:s' => \$gmondConf,
+        'html!' => \$html,
+        'html-report-css:s' => \$htmlReportCSS,
+        'html-report-path:s' => \$htmlReportPath,
+        'html-report-sorter:s' => \$htmlReportSorter,
+        'html-report-title:s' => \$htmlReportTitle,
+        'lock:s' => \$lockFile,
+        'lockout!' => \$lockout,
+        'log:s' => \$logFile,
+        'manual!' => \$manual,
+        'syslog!' => \$syslog,
+        'tooltip-max-len:i' => \$tooltipMaxLen,
+        'tooltip-max-nodes:i' => \$tooltipMaxNodes,
+        'trace!' => \$trace,
+        ) || pod2usage(EXIT_BADOPT);
+
+LockoutPreDaemonize($lockFile) if ($lockout);
+
+if (!$debug && !$trace && !$manual) {
+        my $pid = fork;
+        Fatal("fork failed: $!") if (!defined($pid));
+        exit(0) if ($pid > 0);
+	open STDOUT, ">$logFile" || Fatal("Could not open output file '$logFile'");
+	open STDERR, ">&STDOUT";
+        close STDIN;
+}
+
+LockoutPostDaemonize if ($lockout);
+
+
+my $dbh = MonitorDB::Connect($dbHost, $dbPort, $dbName, $dbUser, $dbPassword);
+$dbh->{AutoCommit} = 0;
+PrepareQueries($dbh);
+
+if ($ganglia) {
+        my $gmondConfTemp = '/etc/ganglia/gmond.conf';
+        if ( -e $gmondConfTemp) {
+            my $gconfStr = `cat $gmondConfTemp`;
+            my $fh;
+            $gconfStr =~ s/(host_tmax\s*=\s*\d+)/\/\* $1 \*\//g;
+            $gconfStr =~ s/(retry_bind\s*=\s*\w+)/\/\* $1 \*\//g;
+            $gconfStr =~ s/(gzip_output\s*=\s*\w+)/\/\* $1 \*\//g;
+            $gconfStr =~ s/(buffer\s*=\s*\d+)/\/\* $1 \*\//g;
+            open $fh, '>', $gmondConf;
+            print $fh $gconfStr;
+            close $fh;
+        }
+
+        $gmond = Ganglia::Gmetric::XS->new(config => $gmondConf, spoof => '');
+        Fatal("Could not initialize Ganglia gmond connection") unless ($gmond);
+}
+
+LogOpen();
+
+$::dumpCurrent = 0;
+$::dumpFSstate = 0;
+$::dumpHstate = 0;
+
+sub SetDumpCurrent
+{
+        $::dumpCurrent = 1;
+}
+
+sub SetDumpStates
+{
+        $::dumpFSstate = 1;
+        $::dumpHstate = 1;
+}
+
+$::running = 1;
+sub ExitLoop
+{
+        $::running = 0;
+}
+
+use sigtrap qw(handler ExitLoop HUP);
+use sigtrap qw(handler SetDumpCurrent USR1);
+use sigtrap qw(handler SetDumpStates USR2);
+
+################################################################################
+#
+# MAIN LOOP
+#
+################################################################################
+
+my $state = STATE_REPORT;
+my $secs;
+my $stepStart;
+
+main_loop:
+while ($::running) {
+	$stepStart = time;
+	#print STDERR "stepStart: $stepStart state: $state dumpCurrent: $::dumpCurrent dumpHstate: $::dumpHstate\n" if ($trace);
+	Debug("stepStart: $stepStart state: $state dumpCurrent: $::dumpCurrent dumpHstate: $::dumpHstate");
+	if ($manual) {
+		my $a;
+
+        again:
+		print STDERR "action(s) [r = ProcessReports, t = TrackState, c = DumpCurrent, f = DumpFSstate, h = DumpHstate, q = quit]? ";
+		chomp($a = <STDIN>);
+                if ($a eq 'q') {
+                        last main_loop;
+
+                } elsif ($a eq 'c') {
+                        DumpCurrent($dbh);
+
+                } elsif ($a eq 'f') {
+                        DumpFSstate($dbh);
+
+                } elsif ($a eq 'h') {
+                        DumpHstate($dbh);
+
+                } elsif ($a eq 'r') {
+                        $state = STATE_REPORT;
+
+                } elsif ($a eq 't') {
+                        $state = STATE_TRACK;
+
+                } else {
+                        print STDERR "unrecognized action '$a'\n";
+                        goto again;
+                }
+	}
+
+        GangliaSendHeartbeats() if ($ganglia && ($state != STATE_REPORT));
+
+	if ($state == STATE_REPORT) {
+		my $str;
+		my $content = IO::String->new($str);
+
+		ProcessReports($dbh, $content, $gmond);
+		if ($debug) {
+			Debug($str) if ($html);
+
+		} elsif ($html) {
+                        my $newReportPath = "$::htmlReportPath.new";
+			if (open(R, ">$newReportPath")) {
+				print R $str;
+				close(R);
+				unlink($::htmlReportPath);
+				rename($newReportPath, $::htmlReportPath);
+			}
+		}
+
+		if ($::dumpCurrent) {
+			DumpCurrent($dbh);
+			$::dumpCurrent = 0;
+		}
+
+	} elsif ($state == STATE_TRACK) {
+		TrackState($dbh);
+		if ($::dumpFSstate) {
+			DumpFSstate($dbh);
+			$::dumpFSstate = 0;
+		}
+
+		if ($::dumpHstate) {
+			DumpHstate($dbh);
+			$::dumpHstate = 0;
+		}
+
+	} else {
+                Fatal("Unhandled state $state in main loop");
+        }
+
+	$secs = $secsPerStep - (time - $stepStart);
+	Debug("stepend: secs: $secs");
+	next if ($manual);
+        $state = STATE_REPORT if (++$state == NSTATES);
+        sleep($secs) if ($secs > 0);
+}
+
+$awolQ->finish if (defined($awolQ));
+$blockerQ->finish if (defined($blockerQ));
+$dumpCurrentQ->finish if (defined($dumpCurrentQ));
+$dumpHstateQ->finish if (defined($dumpHstateQ));
+$gpfsStateQ->finish if (defined($gpfsStateQ));
+$maxCurrentTSQ->finish if (defined($maxCurrentTSQ));
+$mountStatsQ->finish if (defined($mountStatsQ));
+$populateCurrentQ->finish if (defined($populateCurrentQ));
+$populateWaitersQ->finish if (defined($populateWaitersQ));
+$reportAgeQ->finish if (defined($reportAgeQ));
+$trackStateQ->finish if (defined($trackStateQ));
+$truncateCurrentQ->finish if (defined($truncateCurrentQ));
+$waiterDepsQ->finish if (defined($waiterDepsQ));
+$waiterStatsQ->finish if (defined($waiterStatsQ));
+$waiterTnameQ->finish if (defined($waiterTnameQ));
+
+MonitorDB::Finish($dbh);
+exit(EXIT_SUCCESS);
+
+=encoding utf8
+
+=head1 NAME
+
+gpfsreporter - GPFS Monitoring Suite report generating daemon
+
+=head1 SYNOPSIS
+
+B<gpfsreporter> [options]
+
+=head1 DESCRIPTION
+
+B<gpfsreporter> is the component of the GPFS Monitoring Suite that
+summarizes recent client status messages, and can generate a HTML
+report and send metrics to Ganglia.
+
+B<gpfsreporter> runs its reporting cycle in two phases over the course
+of 2 minutes.
+
+The first phase determines the set of client node (B<gpfsmond>) status messages
+that have been received in the last 10 minutes and places them into the
+I<current> temporary data base table,  then generates the HTML report and
+submits Ganglia metrics based on the contents of that table.
+
+The second phase uses the contents of the I<current> table to keep a
+shadow state of all GPFS client nodes, and uses syslog to report changes in that
+state.
+
+=head1 OPTIONS
+
+=over 4
+
+=item B<--config> F<path>
+
+Define the configuration file path name (default F</etc/gpfsreporter.conf>).
+
+=item B<--db-host> I<host-name|IP-address>
+
+Define the database connection host name or IP address (default I<localhost>).
+
+=item B<--db-name> I<database-name>
+
+Define the database name (default I<gpfsmonitor>).
+
+=item B<--db-password> I<password>
+
+Define the data base access user password (default is no password).
+
+=item B<--db-port> I<service-name|port-number>
+
+Define the database connection port number (default the DBI driver's default value).
+
+=item B<--db-user> I<user-name>
+
+Define the data base access user name (default is I<gpfsmonitor>).
+
+=item B<--debug>
+
+Enable debug output.
+
+=item B<--dumps-dir> F<path>
+
+Define the path name of the directory in which to write state dumps in response
+to certain signals (see SIGNALS below, default F</nfs/home/dasg/logs/gpfsmonitor>).
+
+=item B<--expelled-list> F<path>
+
+Define the path name of the expelled node list file (default F</nfs/ssg/dasg/gpfs/glade/expelled>).
+
+=item B<--ganglia>
+
+Enable Ganglia metric reporting (default).
+
+=item B<--gm-dmax> I<n>
+
+Define the Ganglia metric dmax value (default I<0>).
+
+=item B<--gm-tmax> I<n>
+
+Define the Ganglia metric tmax value (default I<120>).
+
+=item B<--gmond-conf> F<path>
+
+Define the path name of the Ganglia configuration file to use for sending metrics
+(default F</opt/local/ganglia-3.4.0/etc/gmond.conf.gpfsmonitor>).
+
+=item B<--help>
+
+Display a brief help message and exit.
+
+=item B<--html>
+
+Enable HTML report updates (default).
+
+=item B<--html-report-css> I<css-name>
+
+Define the stylesheet name for the HTML report (default I<report.css>).
+
+=item B<--html-report-path> F<path>
+
+Define the path to the HTML report file (default F</var/www/html/gpfs/report.html>).
+
+=item B<--html-report-title> I<title>
+
+Define the HTML report title (default I<GPFS Monitor Report>).
+
+=item B<--html-table-sorter> I<script-name>
+
+Define the HTML report table column resorting script (default I<sorttable.js>).
+
+=item B<--lock> F<path>
+
+Define the path to the daemon lockout file (default F</var/run/gpfsreporter>).
+
+=item B<--lockout>
+
+Enable the daemon lockout check (default).  When enabled, gpfsreporter attempts to
+determine if another copy is currently running, and exits if one is found.
+
+=item B<--log> F<path>
+
+Define the path to the log file (default F</var/log/gpfsreporter>).
+
+=item B<--man>
+
+Display the manual page and exit.
+
+=item B<--manual>
+
+Enable manual loop control for debugging.
+
+=item B<--nodebug>
+
+Disable debug output (default).
+
+=item B<--noganglia>
+
+Disable Ganglia metric reporting.
+
+=item B<--nohtml>
+
+Disable HTML report updates.
+
+=item B<--nolockout>
+
+Disable the daemon lockout check.
+
+=item B<--nomanual>
+
+Disable manual loop control for debugging (default).
+
+=item B<--tooltip-max-len> I<n>
+
+Define the maximum length (in characters) of the HTML reports tool tip popup to be I<n>.
+
+=item B<--tooltip-max-nodes> I<n>
+
+Define the maximum number of nodes reported in the of the HTML reports tool tip popup to be I<n>.
+
+=item B<--trace>
+
+Enable the report loop state cycle messages.
+
+=item B<--version>
+
+Display the gpfsreporter script version and exit.
+
+=back
+
+=head1 CONFIGURATION PARAMETERS
+
+=over 4
+
+=item C<$dbHost>
+
+See the description of the B<--db-host> option.
+
+=item C<$dbPort>
+
+See the description of the B<--db-port> option.
+
+=item C<$dbPassword>
+
+See the description of the B<--db-password> option.
+
+=item C<$dbUser>
+
+See the description of the B<--db-user> option.
+
+=item C<$debug>
+
+See the description of the B<--debug> option.
+
+=item C<$dumpsDir>
+
+See the description of the B<--dumps-dir> option.
+
+=item C<$expelledList>
+
+See the description of the B<--expelled-list> option.
+
+=item C<$ganglia>
+
+See the description of the B<--ganglia> option.
+
+=item C<$gmDmax>
+
+See the description of the B<--gm-dmax> option.
+
+=item C<$gmTmax>
+
+See the description of the B<--gm-tmax> option.
+
+=item C<$gmondConf>
+
+See the description of the B<--gmond-conf> option.
+
+=item C<$html>
+
+See the description of the B<--html> option.
+
+=item C<$htmlReportCSS>
+
+See the description of the B<--html-report-css> option.
+
+=item C<$htmlReportPath>
+
+See the description of the B<--html-report-path> option.
+
+=item C<$htmlReportTitle>
+
+See the description of the B<--html-report-title> option.
+
+=item C<$htmlTableSorter>
+
+See the description of the B<--html-table-sorter> option.
+
+=item C<$lockFile>
+
+See the description of the B<--lock> option.
+
+=item C<$lockout>
+
+See the description of the B<--lockout> option.
+
+=item C<$logFile>
+
+See the description of the B<--log> option.
+
+=item C<$manual>
+
+See the description of the B<--manual> option.
+
+=item C<$syslog>
+
+See the description of the B<--syslog> option.
+
+=item C<$tooltipMaxLen>
+
+See the description of the B<--tooltip-max-len> option.
+
+=item C<$tooltipMaxNodes>
+
+See the description of the B<--tooltip-max-nodes> option.
+
+=item C<$trace>
+
+See the description of the B<--trace> option.
+
+=back
+
+=head1 HTML REPORTING
+
+B<gpfsreporter> will generate an HTML page with the following
+sections:
+
+=over 4
+
+=item *
+
+node report age summary table
+
+=item *
+
+GPFS state summary table
+
+=item *
+
+waiter statistics summary table
+
+=item *
+
+waiter dependencies list (i.e. the other nodes upon which a node is waiting)
+
+=item *
+
+blocking node list (i.e. counts of how many other nodes are waiting on this node)
+
+=item *
+
+waiter thread names and reasons counts
+
+=item *
+
+file system mount statistics summary table
+
+=item *
+
+AWOL (away without leave) node list
+
+=item *
+
+expelled node list
+
+=back
+
+Two auxillary files should be installed in the directory where the report
+will be placed.  The first is the stylesheet referenced in the HTML
+header, I<report.css>, which defines cell background colors used to
+highlight cells that may indicate problems.  The second is the browser
+side table column sorting Javascript, I<sorttable.js>.
+
+=head1 GANGLIA METRICS
+
+The following metrics can be sent to a Ganglia cluster.  All of the statistics
+are reported on a per-GPFS cluster basis, which is defined by the cluster's
+name and the corresponding pseudo-IP address used when spoofing the metric.
+You must define the mapping from the GPFS cluster name to the pseudo-IP address
+in the B<gpfsreporter> configuration file, and also define the corresponding
+entries (with lower case host names for Ganglia to work correctly) in either
+F</etc/hosts> or some other appropriate source such as DNS.
+
+=head2 GPFS State
+
+=over 4
+
+=item I<gm_nodes_known>
+
+The number of known nodes in the cluster.
+
+=item I<gm_nodes_reporting>
+
+The number of nodes that have reported in during this interval.
+
+=item I<gm_state_active>
+
+The number of nodes in the GPFS active state.
+
+=item I<gm_state_arbitrating>
+
+The number of nodes in the GPFS arbitrating state.
+
+=item I<gm_state_broken>
+
+The number of nodes on which B<mmgetstate> failed to run correctly.
+
+=item I<gm_state_down>
+
+The number of nodes in the GPFS down state.
+
+=item I<gm_state_initializing>
+
+The number of nodes in the GPFS initializing state.
+
+=item I<gm_nodes_monerrs>
+
+The number of nodes that encountered errors during B<gpfsmond> processing.
+
+=item I<gm_nodes_rdma>
+
+The number of nodes with a verbs RDMA anomaly.
+
+=item I<gm_state_unknown>
+
+The number of nodes about which no information is available.
+
+=back
+
+=head2 Status Report Ages
+
+=over 4
+
+=item I<gm_rptage_0m_10m>
+
+The number of nodes that have reported in within the last 10 minutes.
+
+=item I<gm_rptage_10m_60m>
+
+The number of nodes that last reported in betwen 10 and 60 minutes ago.
+
+=item I<gm_rptage_1h_6h>
+
+The number of nodes that last reported in betwen 1 and 6 hours ago.
+
+=item I<gm_rptage_6h_24h>
+
+The number of nodes that last reported in betwen 6 and 24 hours ago.
+
+=item I<gm_rptage_1d_inf>
+
+The number of nodes that last reported in longer than 1 day ago.
+
+=item I<gm_rptage_future>
+
+The number of nodes that last that have reported back from the future.
+This is caused by a lack of node clock synchronization.
+
+=item I<gm_rptage_never>
+
+The number of nodes that last that have never reported in.
+
+=back
+
+=head2 File System States
+
+Within each cluster, the states of all of the known GPFS device names
+of mounted GPFS file systems is reported.  In the metric names below,
+the percent sign (C<%>) is replaced by the GPFS device name.
+
+=over 4
+
+=item I<gm_%_mounted_accessible>
+
+The number of nodes with the file system mounted and usable.
+
+=item I<gm_%_mounted_stale>
+
+The number of nodes with the file system mounted but stale (errno ESTALE).
+
+=item I<gm_%_remount_failure>
+
+The number of nodes where the B<gpfsmond> initiated remount failed.
+Note that if B<gpfsmond> ran into interference with GPFS performing
+the remount itself, this state is reported.
+
+=item I<gm_%_remount_success>
+
+The number of nodes where the B<gpfsmond> initiated remount succeeded.
+
+=item I<gm_%_unmounted_error>
+
+The number of nodes with the file system unmounted due to some error.
+
+=item I<gm_%_unmounted_nodev>
+
+The number of nodes with the file system unmounted (errno ENODEV).
+
+=item I<gm_%_unmounted_unusable>
+
+The number of nodes with the file system unmounted due to other causes.
+
+=item I<gm_%_unknown>
+
+The number of nodes with the file system in an unknown state (possibly
+due to a lack of a recent node status report).
+
+=back
+
+=head2 Waiter Stats
+
+Note that B<gpfsmond> is configured to filters out waiters below a certain
+threshold (the default is 10 seconds).
+
+=over 4
+
+=item I<gm_waiter_max_secs>
+
+The maximum waiter wait time in seconds for this cluster.
+
+=item I<gm_waiter_min_secs>
+
+The minimum waiter wait time in seconds for this cluster.
+
+=item I<gm_waiter_nodes>
+
+The number of nodes that have any waiters.
+
+=item I<gm_waiter_threads>
+
+The number of threads that are waiting.
+
+=item I<gm_waiter_0_1m>
+
+The number of nodes with waiters wait times below 1 minute.
+
+=item I<gm_waiter_1m_5m>
+
+The number of nodes with waiters wait times between 1 and 5 minutes.
+
+=item I<gm_waiter_5m_20m>
+
+The number of nodes with waiters wait times between 5 and 20 minutes.
+
+=item I<gm_waiter_20m_60m>
+
+The number of nodes with waiters wait times between 20 and 60 minutes.
+
+=item I<gm_waiter_1h_inf>
+
+The number of nodes with waiters wait times greater than 1 hour.
+
+=back
+
+=head1 RETURN CODES
+
+=over 4
+
+=item C<0>
+
+Success.
+
+=item C<1>
+
+A failure was detected.
+
+=item C<2>
+
+A bad option argument was provided or was missing.
+
+=item C<3>
+
+The configuration file had a parse or syntax error.
+
+=back
+
+=head1 SIGNALS
+
+=over 4
+
+=item SIGHUP
+
+Causes B<gpfsreporter> to exit.  
+
+=item SIGUSR1
+
+Causes B<gpfsreporter> to dump the latest I<current> table's entries
+into a file in the directory defined by B<--dumps-dir>.
+
+=item SIGUSR2
+
+Causes B<gpfsreporter> to dump the latest I<hstate> and I<fsstate> tables'
+entries into files in the directory defined by B<--dumps-dir>.
+
+=back
+
+Note that the dump files will only be produced during the proper step of the reporting
+cycle, so there may be a delay before one appears.
+
+=cut

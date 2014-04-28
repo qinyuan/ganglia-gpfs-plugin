@@ -1,0 +1,159 @@
+#
+# gpfsmond extension to monitor gpfs io state
+#
+
+my $EXTNAME = 'gpfsio';
+
+package GPFSIO;
+use feature 'state';
+
+my $enable = 1;
+my $extensionPath = $::extensionPath;
+
+sub OptionHook ()
+{
+        my $usageVerbosity = 0;
+
+        ::Debug("$EXTNAME: extensionPath: '$extensionPath'");
+        ::Getopt::Long::Configure("prefix=--${EXTNAME}-");
+        ::GetOptions(
+                'enable!' => \$enable,
+                'help' => sub { $usageVerbosity = 1; },
+                'man'  => sub { $usageVerbosity = 2; },
+        ) || ::Warning("$EXTNAME GetOptions failed");
+
+        ::pod2usage(-input => $extensionPath, -exitstatus => 0, -verbose => $usageVerbosity) if ($usageVerbosity);
+}
+
+sub testlog {
+    print "\n========================\n";
+    print shift;
+    print "\n========================\n";
+}
+
+sub CollectHook ($)
+{
+        return if (!$enable);
+        update_metric();
+
+        ::Debug("${EXTNAME}::gpfsio called");
+}
+
+sub trim {
+    $str = shift;
+    $str =~ s/^\s//;
+    $str =~ s/\s$//;
+    return $str;
+}
+
+sub get_fs_io_map {
+    my $result_str = exec_pmon('fs_io_s');
+    my @result_arr = split(/_fs_io_s_/, $result_str);
+    shift(@result_arr);
+    my %map;
+    foreach (@result_arr) {
+        my @line_arr = split(/\s/, trim($_));
+        my %line_map;
+        my $i = 0;
+        my $line_arr_len = @line_arr;
+        while ($i < $line_arr_len) { 
+            if ($line_arr[$i] =~ /_\w+_/) {
+                $line_map{$line_arr[$i]} = $line_arr[$i+1];
+                $i = $i + 2;
+            } else {
+                $i++;
+            }
+        }
+        $map{'gpfs_io_br_' . $line_map{'_fs_'}} = $line_map{'_br_'};
+        $map{'gpfs_io_bw_' . $line_map{'_fs_'}} = $line_map{'_bw_'};
+    }
+    return %map;
+}
+
+sub get_tmp_dir {
+    return '/tmp/gpfs/';
+}
+
+sub exec_pmon($){
+    my $command_file = shift;
+
+    my $tmp_dir = get_tmp_dir();
+    unless ( -e $tmp_dir) {
+        `mkdir $tmp_dir`;
+    }
+    my $full_file_name = $tmp_dir . $command_file;
+    unless ( -e $full_file_name) {
+        `echo '$command_file' > $full_file_name`;
+    }
+    my $pmon_command = "/usr/lpp/mmfs/bin/mmpmon -p -i $full_file_name";
+    return `$pmon_command`;
+}
+
+sub get_gmetric_path {
+    my $gmetric_path = `whereis gmetric`;
+    $gmetric_path =~ s/^[^:]+:\s*//g;
+    $gmetric_path =~ s/\s.*$//g;
+    ::Debug('initialize $gmetric_path as: ' . $gmetric_path);
+    return $gmetric_path;
+}
+
+sub call_gmetric {
+    my $metric_name = shift;
+    my $metric_value = shift;
+    state $gmetric_path = get_gmetric_path();
+
+    `$gmetric_path -n '$metric_name' -v '$metric_value' -t float -s 'localhost'`;
+    ::Debug("$metric_name: $metric_value");
+}
+
+sub update_metric() {
+    my $time_record_file = get_tmp_dir . 'gpfs_io_record_time';
+    my $last_timestamp = read_file($time_record_file); 
+    my $timestamp = time();
+
+    if ($last_timestamp =~ /^\d+$/ ){
+        my %fs_io_map = get_fs_io_map();
+        my $last_timestamp = int($last_timestamp);
+        my $timestamp_diff = $timestamp - $last_timestamp;
+        while (my ($key, $value) = each %fs_io_map) {
+            my $metric_name = $key;
+            $metric_name =~ s/br/rps/g;
+            $metric_name =~ s/bw/wps/g;
+            my $metric_value = int(int($value) / $timestamp_diff);
+            call_gmetric($metric_name, $metric_value);
+        }
+    } 
+
+    exec_pmon('reset');
+    write_file($time_record_file, $timestamp);
+}
+
+sub read_file($) {
+    my $file_name = shift;
+    my $fh;
+    my $content;
+    unless( -e $file_name) {
+        return '';
+    }
+    open $fh, '<', $file_name;
+    while (my $line = <$fh> ) {
+        chomp($line);
+        $content .= $line;
+    }
+    $content;
+}
+
+sub write_file($$) {
+    my $file_name = shift;
+    my $content = shift;
+    my $fh;
+    open $fn, '>', $file_name;
+    print $fn $content;
+    close $fn;
+}
+
+::InstallCollectHook($EXTNAME, \&CollectHook);
+
+package main;
+
+1;
