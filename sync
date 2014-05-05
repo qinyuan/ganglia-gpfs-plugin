@@ -1,0 +1,4 @@
+#!/bin/sh
+
+scp conf.php root@node3:/var/www/html/gweb/
+scp conf.php root@rh8:/var/www/html/gweb/

@@ -1,0 +1,4 @@
+#!/bin/sh
+
+scp *.php root@node3:/root/html/gweb/graph.d/
+#scp *.php root@rh8:/var/www/html/gweb/graph.d/

@@ -16,20 +16,23 @@ function graph_gpfs_io_report(&$rrdtool_graph) {
   $first = true;
   foreach ($filesystems as $fs) {
     $series -> setRrdFile("gpfs_io_rps_$fs.rrd");
-    #$series -> setColor("#FFFF00");
+    if (!$series -> validateRrdDir()) {
+      continue;
+    }
+
     $series -> setColor($colorFactory -> getInstance());
     $series -> setTitle("$fs rps");
     if ($first) {
       $series -> setType(RrdToolGraphSeries::AREA);
       $first = false;
+    } else {
+      $series -> setType(RrdToolGraphSeries::STOCK);
     }
     $builder -> addSeries(clone $series);
     
     $series -> setRrdFile("gpfs_io_wps_$fs.rrd");
-    #$series -> setColor("#00FF00");
     $series -> setColor($colorFactory -> getInstance());
     $series -> setTitle("$fs wps");
-    $series -> setType(RrdToolGraphSeries::STOCK);
     $builder -> addSeries(clone $series);
   }
 

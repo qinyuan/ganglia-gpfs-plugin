@@ -82,11 +82,16 @@ class RrdToolGraphSeries {
   	$this -> unit = $is_percent ? '%' : 's;';
   }
 
-  function __toString() {
+  function validateRrdDir() {
     $fullRrdFilePath = $this -> rrd_root . $this -> rrd_file;
-    if (!file_exists($fullRrdFilePath)) {
+    return file_exists($fullRrdFilePath); 
+  }
+
+  function __toString() {
+    if (!$this -> validateRrdDir()) {
       return "";
     }
+    $fullRrdFilePath = $this -> rrd_root . $this -> rrd_file;
     $graph_name = str_replace(".rrd", "", $this -> rrd_file);
     $str = "DEF:'$graph_name'='$fullRrdFilePath':'sum':AVERAGE ";
 
@@ -247,6 +252,10 @@ class ColorFactory{
         '#FFB6C1',
         '#FF4500',
         '#2F4F4F',
+        '#88eF34',
+        '#24E7E7',
+        '#A8A8A8',
+        '#e827e8',
     );
     private $len;
 

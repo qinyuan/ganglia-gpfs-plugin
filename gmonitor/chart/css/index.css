@@ -1,4 +1,6 @@
 div.cluster {
+  position: relative;
+  float: none;
   border: 1px solid darkgray;
   padding: 0;
   margin: 10px 0;
@@ -7,6 +9,7 @@ div.cluster {
 }
 
 div.clusterName {
+  position: relative;
   background-color: #eed5b7;
   padding: 10px;
   font-size: 16pt;
@@ -14,6 +17,7 @@ div.clusterName {
 }
 
 div.clusterChart {
+  position: relative;
   padding: 20px;
 }
 

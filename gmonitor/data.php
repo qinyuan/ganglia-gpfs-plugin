@@ -10,14 +10,12 @@ function get_modules_json() {
 
 function get_navi_tree_json() {
     $modules_json = get_modules_json();
-    $menu = array(
-        'text' => '监控模块',
-        "children" => array()
-    );
+    $menu = array();
     $id = 1;
     foreach ($modules_json as $module_json) {
         $module = array(
             "text" => $module_json -> name,
+            'iconCls' => 'icon-module',
             "state" => "open",
             "children" => array()
         );
@@ -28,9 +26,9 @@ function get_navi_tree_json() {
                 'text' => $link -> text,
             );
         }
-        $menu["children"][] = $module;
+        $menu[] = $module;
     }
-    return array($menu);
+    return $menu;
 }
 
 function get_href_by_id($id) {

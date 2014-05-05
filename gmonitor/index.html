@@ -3,12 +3,33 @@
 <head>
     <meta charset="utf-8">
     <title>集群监控系统</title>
-    <script src="index.js"></script>
+    <link rel="stylesheet" href="easyui/themes/default/easyui.css">
+    <link rel="stylesheet" href="easyui/themes/icon.css">
 </head>
-    <frameset cols="15%,*">
-        <frame id="leftFrame" src="left.html" />
-        <frame id="rightFrame" src="" />
-    </frameset>
-    <body>
-    </body>
+<body class="easyui-layout" style="text-align:left">
+    <div region="west" split="true" title="可用插件模块" style="width:180px;padding:5px;">
+        <ul id="mainTree"></ul>
+        <br>
+        <hr>
+        <div class="toolbar">
+            &nbsp;&nbsp;&nbsp;&nbsp;
+            <a id="newWin" target="_blank" href="javascript:void(0)" 
+                title="在新窗口中打开当前选项卡">
+                <img src="images/new_win.gif" height="30" width="30" />
+            </a>
+            &nbsp;&nbsp;&nbsp;&nbsp;
+            <a id="refresh" href="javascript:void(0)" title="刷新当前选项卡">
+                <img src="images/refresh.gif" height="30" width="30" />
+            </a>
+        </div>
+    </div>
+    <div region="center">
+        <div id="tt"></div> 
+        <!--<div id="tt" class="easyui-tabs" fit="true" border="false" plain="true"></div> -->
+    </div>      
+</body>
+<script src="easyui/jquery.min.js"></script>
+<script src="easyui/jquery.cookie.js"></script>
+<script src="easyui/jquery.easyui.min.js"></script>
+<script src="index.js"></script>
 </html>
