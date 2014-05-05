@@ -1,6 +1,7 @@
 function openSubWin(href, title) {
-    var iframeTpl = '<iframe src="' + href + 
-        '" height="98%" width="99%"></iframe>';
+    var frameIndex = $('#tt').tabs('tabs').length + 1;
+    var iframeTpl = '<iframe src="' + href + '" id="iframe' + frameIndex
+        + '" height="98%" width="99%"></iframe>';
     $('#tt').tabs('add', {
         'title': title,
         content: iframeTpl,
@@ -10,7 +11,8 @@ function openSubWin(href, title) {
 
 function refreshTab() {
     var $iframe = $($('#tt').tabs('getSelected')).find('iframe');
-    $iframe.attr('src', $iframe.attr('src'));
+    var id = $iframe.attr('id');
+    window.frames[id].location.reload();
 }
 
 function updateNewWinHref(tabId) {
@@ -20,15 +22,22 @@ function updateNewWinHref(tabId) {
 
 function changePage() {
     var selectedTree = $mainTree.tree('getSelected');
+    var treeText = selectedTree.text;
     var hrefId = selectedTree.id;
-    if (hrefId) {
-        $.get('data.php', {
-            'data': 'href',
-            'hrefId': hrefId
-        }, function(href) {
-            openSubWin(href, selectedTree.text);
-            recordHrefStatus(hrefId);
-        });
+    var $tabs = $('#tt');
+    if ($tabs.tabs('getTab', treeText) === null) {
+        if (hrefId) {
+            $.get('data.php', {
+                'data': 'href',
+                'hrefId': hrefId
+            }, function(href) {
+                openSubWin(href, treeText);
+                recordHrefStatus(hrefId);
+            });
+        }
+    } else {
+        $tabs.tabs('select', treeText);
+        recordHrefStatus(hrefId);
     }
 }
 
@@ -47,7 +56,6 @@ function loadLatestHrefId() {
         changePage(latestHrefId);
     }
 }
-
 
 $('#refresh').click(refreshTab);
 $('#tt').tabs({
