@@ -102,8 +102,12 @@ sub call_gmetric {
     my $metric_value = shift;
     state $gmetric_path = get_gmetric_path();
 
-    `$gmetric_path -n '$metric_name' -v '$metric_value' -t float -s 'localhost'`;
-    ::Debug("$metric_name: $metric_value");
+    if ($gmetric_path =~ /^\s*$/ || $gmetric_path =~ /^.*man.*$/) {
+        ::Debug("can find gmetric command path");
+    } else {
+        `$gmetric_path -n '$metric_name' -v '$metric_value' -t float -s 'localhost'`;
+        ::Debug("$metric_name: $metric_value");
+    }
 }
 
 sub update_metric() {

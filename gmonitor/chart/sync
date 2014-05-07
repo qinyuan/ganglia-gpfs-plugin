@@ -1,4 +1,6 @@
 #!/bin/sh
 
-scp css/* root@node3:/var/www/html/gmonitor/chart/css/
-scp templates/* root@node3:/var/www/html/gmonitor/chart/templates/
+#scp css/* root@node3:/var/www/html/gmonitor/chart/css/
+#scp templates/* root@node3:/var/www/html/gmonitor/chart/templates/
+scp css/* root@rh8:/var/www/html/gmonitor/chart/css/
+scp templates/* root@rh8:/var/www/html/gmonitor/chart/templates/

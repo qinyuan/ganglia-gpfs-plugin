@@ -416,16 +416,45 @@ sub MetricTmplAttrs ($)
 sub GangliaSendHeartbeats ()
 {
         foreach my $k (keys %pseudoIPAddr) {
-                $gmond->heartbeat(spoof => SpoofHost($k));
+                $gmond->heartbeat(spoof => getAdjustedSpoof(SpoofHost($k)));
         }
+}
+
+my %hosts;
+sub getAdjustedSpoof($) {
+    unless (%hosts) {
+        my $fh;
+        open $fh, '<', '/etc/hosts';
+        while ( <$fh> ) {
+            chomp($_);
+            unless ($_ eq '') {
+                my @host_arr = split(/[\s|,]+/, $_);
+                if ($#host_arr >=1 ) {
+                    $hosts{$host_arr[0]} = $host_arr[1];
+                }
+            }
+        }
+    }
+
+    my $str = shift;
+    my @str_arr = split(/:/, $str);
+    if ($hosts{$str_arr[0]}) {
+        return $str_arr[0] . ':' . $hosts{$str_arr[0]};
+    } else {
+        return $str;
+    }
 }
 
 sub MetricSend ($@)
 {
-        return if (!$ganglia);
+    return if (!$ganglia);
 
 	my $gmond = shift;
 	my %args = @_;
+
+    foreach (keys %args) {
+        $args{'spoof'} = getAdjustedSpoof($args{'spoof'});
+    }
 
 	if ($debug) {
 		foreach my $k (sort keys %args) {

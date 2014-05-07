@@ -1,3 +1,4 @@
 #!/bin/sh
 
-scp index.* root@node3:/var/www/html/gmonitor
+#scp index.* root@node3:/var/www/html/gmonitor
+scp index.* root@rh8:/var/www/html/gmonitor
