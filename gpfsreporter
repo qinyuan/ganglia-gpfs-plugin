@@ -46,6 +46,7 @@ my $gpfsreporterRevision = '20131213';
 my $secsPerStep = 5;
 my $secsPerCycle = $secsPerStep * NSTATES;
 my $usageVerbosity;
+my $dbh;
 
 our $dbHost;
 our $dbName;
@@ -481,9 +482,25 @@ sub RegisterClusterPseudoIP (@)
 sub SpoofHost ($)
 {
 	my $c = shift;
-        my $a = $pseudoIPAddr{$c};
+    my $a = $pseudoIPAddr{$c};
 
-        Fatal("(Ganglia metrics): no pseudoIP defined for cluster '$c'") unless (defined($a));
+    unless (defined($a)) {
+        my $sql = qq{
+            SELECT a.addr FROM ipaddrs AS a 
+                INNER JOIN hosts AS h ON a.host_id=h.id 
+                INNER JOIN clusters AS c ON h.cluster_id=c.id
+                WHERE c.name='$c' limit 1
+        };
+        my $sth = $dbh -> prepare($sql);
+        $sth -> execute();
+        my $addr;
+        $sth -> bind_columns(\$addr);
+        if ($sth -> fetch()) {
+            $a = $addr;
+        }
+    }
+
+    Fatal("(Ganglia metrics): no pseudoIP defined for cluster '$c'") unless (defined($a));
 
 	#
 	# gmond is lower casing host names, but the web interface gets confused
@@ -1412,7 +1429,7 @@ if (!$debug && !$trace && !$manual) {
 LockoutPostDaemonize if ($lockout);
 
 
-my $dbh = MonitorDB::Connect($dbHost, $dbPort, $dbName, $dbUser, $dbPassword);
+$dbh = MonitorDB::Connect($dbHost, $dbPort, $dbName, $dbUser, $dbPassword);
 $dbh->{AutoCommit} = 0;
 PrepareQueries($dbh);
 
