@@ -1,0 +1,643 @@
+#!/usr/bin/perl516
+
+use 5.16.0;
+use English;
+use Fcntl qw(:flock :seek);
+use File::stat;
+use FindBin;
+use Getopt::Long;
+use Pod::Usage;
+use POSIX;
+use Socket;
+
+our $debug = 0;
+
+use lib "$FindBin::Bin/../lib";
+use Utility;
+use MonitorDB;
+use MonitorDB::Cluster;
+use MonitorDB::Entry;
+use MonitorDB::FS;
+use MonitorDB::Hosts;
+use MonitorDB::Waiter;
+
+use strict qw(vars refs subs);
+
+################################################################################
+#
+# PARAMETERS
+#
+# Parameters defined using "my" are not modifiable by a config file due to the
+# behavior of the "do" statement that imports the config file.  Parameters
+# defined using "our" are modifiable by the config file.
+#
+################################################################################
+my $configFile;
+my $defaultConfigFile = '/etc/gpfsmonitor.conf';
+my $gpfsmonitorRevision = '20140110';
+my $monitorProtocol = 'udp';
+my $usageVerbosity;
+
+our $dbHost;
+our $dbName;
+our $dbPassword;
+our $dbPort;
+our $dbUser;
+our $devWhitelist;
+our $doDBInsert = 1;
+our $listenerPort = '9649';
+our $lockFile = '/var/run/gpfsmonitor';
+our $lockout = 1;
+our $logFile = '/var/log/gpfsmonitor';
+our $maxMsgLen = 8192;
+our $maxTimeSkew = 600;
+
+Getopt::Long::Configure('noignore_case', 'pass_through');
+GetOptions(
+        'config:s' => \$configFile,
+        'debug' => \$debug,
+        'help' => sub { $usageVerbosity = 1; },
+        'man' => sub { $usageVerbosity = 2; },
+        'version' => sub { print "$PROGRAM_NAME version: $gpfsmonitorRevision\n"; exit(EXIT_SUCCESS); },
+        ) || pod2usage(EXIT_BADOPT);
+
+pod2usage(-exitstatus => 0, -verbose => $usageVerbosity) if ($usageVerbosity);
+
+# TODO: after all V1 gpfsmond clients are updated, remove hname arg
+sub ClusterNameHook ($$)
+{
+        my $cname = shift;
+        my $hname = shift;
+
+        return($cname);
+}
+
+sub HostNameHook ($)
+{
+        my $hname = shift;
+
+        return($hname);
+}
+
+ReadConfig($configFile, $defaultConfigFile);
+
+Getopt::Long::Configure('default', 'nopass_through');
+GetOptions(
+        'db-host:s' => \$dbHost,
+        'db-name:s' => \$dbName,
+        'db-password:s' => \$dbPassword,
+        'db-port:s' => \$dbPort,
+        'db-user:s' => \$dbUser,
+        'debug' => \$debug,
+        'dev-whitelist:s' => sub { $devWhitelist = qr/$_[1]/; },
+        'insert!' => \$doDBInsert,
+        'listener-port:s' => \$listenerPort,
+        'lock:s' => \$lockFile,
+        'lockout!' => \$lockout,
+        'log:s' => \$logFile,
+        'max-msg-len:i' => \$maxMsgLen,
+        'max-time-skew:i' => \$maxTimeSkew,
+        ) || pod2usage(EXIT_BADOPT);
+
+sub ProcessMsg ($$$)
+{
+	my $dbh = shift;
+	my $msg = shift;
+	my $senderAddr = shift;
+	my @lines = split(/\n/, $msg);
+	my $hname;
+	my $state;
+	my $endTime;
+	my $gpfsmondRevision;
+	my $runSecs;
+	my $hid;
+	my $verbsEnabled;
+	my $verbsPorts;
+	my @fss;
+	my @waiters;
+	my @errors;
+	my @f;
+        my $messageType;
+        my $clusterName;
+        my $cid;
+        my $gpfsVersion;
+        my $mountsOk;
+	my $complete = 1;
+
+	while (my $l = shift(@lines)) {
+		if ($l =~ /^proxy:(.+)$/) {
+			$senderAddr = $1;
+			Debug("proxy: $senderAddr") if ($debug);
+			next;
+		}
+
+                if ($l =~ /^ident:/) {
+                        @f = split(/:/, $l);
+                        $messageType = $f[1];
+                        $hname = HostNameHook($f[2]);
+                        $gpfsmondRevision = $f[3];
+                        $clusterName = ClusterNameHook($f[4], $hname);
+			eval {
+				$cid = MonitorDB::Cluster::GetClusterId($dbh, $clusterName);
+			};
+			if ($@) {
+				Warning($@);
+				return;
+			}
+
+                        $gpfsVersion = $f[5];
+			eval {
+				$hid = MonitorDB::Hosts::GetHostId($dbh, $hname, $senderAddr, $cid,
+                                                           $gpfsVersion, $gpfsmondRevision);
+			};
+			if ($@) {
+				Warning($@);
+				return;
+			}
+
+			Debug("ident: messageType: $messageType $hname id: $hid $clusterName cid: $cid gpfsmondRevision: $gpfsmondRevision gpfsVersion: $gpfsVersion") if ($debug);
+                        next;
+                }
+
+		if ($l =~ /^state:/) {
+			@f = split(/:/, $l);
+                        if ($messageType >= 2) {
+				eval {
+					$state = MonitorDB::ValidateGPFSState($f[1]);
+				};
+				if ($@) {
+					Warning($@);
+					return;
+				}
+
+                                $mountsOk = $f[2];
+                                Debug("state: state: $state mountsOk: $mountsOk") if ($debug);
+
+                        } else {
+                                # REMOVE THIS BRANCH WHEN ALL V1 gpfsmond HAVE BEEN UPGRADED
+                                $hname = HostNameHook($f[1]);
+                                $clusterName = ClusterNameHook('', $hname);
+				eval {
+					$cid = MonitorDB::Cluster::GetClusterId($dbh, $clusterName);
+					$state = MonitorDB::ValidateGPFSState($f[2]);
+				};
+				if ($@) {
+					Warning($@);
+					return;
+				}
+
+                                $endTime = $f[4];
+                                $gpfsmondRevision = '0' unless ($gpfsmondRevision = $f[5]);
+				$gpfsVersion = '(not available)';
+                                if (abs($endTime - time) > $maxTimeSkew) {
+                                        Debug("State: ts: $endTime beyond skew") if ($debug);
+                                        return;
+                                }
+
+                                $runSecs = $endTime - $f[3];
+				eval {
+					$hid = MonitorDB::Hosts::GetHostId($dbh, $hname, $senderAddr, $cid,
+                                                                   $gpfsVersion, $gpfsmondRevision);
+				};
+				if ($@) {
+					Warning($@);
+					return;
+				}
+
+                                Debug("state: $hname id: $hid $clusterName cid: $cid vers: $gpfsmondRevision state: $state endTime: $endTime runSecs: $runSecs") if ($debug);
+                        }
+
+			next;
+		}
+
+		if ($l =~ /^verbs:[^:]+:([^:]+):(.*)$/) {
+			$verbsEnabled = ($1 eq 'enable') ? 'true' : 'false';
+			$verbsPorts = $2;
+			Debug("verbs: enabled: $verbsEnabled ports: $verbsPorts") if ($debug);
+			next;
+		}
+
+		if ($l =~ /^fs:/) {
+			@f = split(/:/, $l);
+                        if (defined($devWhitelist)) {
+                                next unless ($f[1] =~ /$devWhitelist/);
+                        }
+
+			my $fsId;
+			eval {
+				$fsId = MonitorDB::FS::GetFSId($dbh, $f[1]);
+			};
+			if ($@) {
+				Warning($@);
+				return;
+			}
+
+			my $mntpt = $f[2];
+			my $mounted = ($f[3] eq 'mounted') ? 'true' : 'false';
+			my $usability;
+			eval {
+				$usability = MonitorDB::ValidateFSUsability($f[4]);
+			};
+			if ($@) {
+				Warning($@);
+				return;
+			}
+
+			my $remount = $f[5];
+			my $remounted;
+                        my $remountEnabled = $f[6] // '0';
+			my $remountError;
+
+			if (length($remount) > 0) {
+				if ($remount eq 'remounted') {
+					$remounted = 'true';
+
+				} else {
+					$remounted = 'false';
+					$remountError = $remount;
+					$remountError =~ s/^error: // if ($remount ne 'disabled');
+				}
+			}
+
+			my $tuple = 'ROW(' . $fsId . ',' .
+					$mounted . ',' .
+					$dbh->quote($usability) . ',' .
+					$dbh->quote($remounted) . ',' .
+					$dbh->quote($remountError) . ',' .
+					$dbh->quote($remountEnabled) . ')::fs_entry';
+			push @fss, $tuple;
+			Debug("fs: $tuple") if ($debug);
+			next;
+		}
+
+                # TODO: fix this for old + new message types
+		if ($l =~ /^waiter:/) {
+                        my $secs;
+                        my $tname;
+                        my $reason;
+                        my $blockingNode;
+
+                        if ($messageType >= 2) {
+                                @f = split(/:/, $l);
+                                $secs = $f[1];
+                                $tname = $f[2];
+                                $reason = $f[3] // '(missing)';
+                                if ($reason eq 'VMM') {
+                                        $blockingNode = '0.0.0.1';
+
+                                } elsif ($reason eq 'DevIO') {
+                                        $blockingNode = '0.0.0.2';
+
+                                } else {
+                                        $blockingNode = $f[4];
+                                }
+
+                        } else {
+                                # REMOVE THIS BRANCH WHEN ALL V1 gpfsmond HAVE BEEN UPGRADED
+                                if ($l =~ /^waiter:([.0-9]+):([^:]+):(.+)$/) {
+                                        $secs = $1;
+                                        $tname = $2;
+                                        $reason = $3 // '(missing)';
+
+                                        if ($reason =~ /^'([^']+)'(?:.*on node\s+([0-9.]+)){0,1}/) {
+                                                $reason = $1;
+                                                $blockingNode = $2;
+                                                if ($blockingNode !~ /\d+\.\d+\.\d+\.\d+/) {
+                                                        Debug("Truncated waiter record '$l'") if ($debug);
+                                                        next;
+                                                }
+                                        }
+                                } else {
+					next;
+				}
+                        }
+
+			my $reasonId;
+                        my $tnameId;
+			eval {
+				$reasonId = MonitorDB::Waiter::GetReasonId($dbh, $reason);
+                                $tnameId = MonitorDB::Waiter::GetTnameId($dbh, $tname);
+			};
+			if ($@) {
+				Warning($@);
+				return;
+			}
+
+                        my $tuple = "($secs, $reasonId, " .  $dbh->quote($blockingNode) . ", $tnameId)";
+                        push @waiters, $tuple;
+                        Debug("waiter: $tuple") if ($debug);
+                        next;
+		}
+
+		if ($l =~ /^error:(.+)$/) {
+			Debug("error: $1") if ($debug);
+			push @errors, $dbh->quote($1);
+			next;
+		}
+
+		if ($l =~ /^end:/) {
+                        # REMOVE THE if WHEN ALL V1 gpfsmond HAVE BEEN UPGRADED
+                        if ($messageType >= 2) {
+                                @f = split(/:/, $l);
+                                $endTime = $f[2];
+                                if (abs($endTime - time) > $maxTimeSkew) {
+                                        Debug("State: ts: $endTime beyond skew") if ($debug);
+                                        return;
+                                }
+
+                                $runSecs = $endTime - $f[1];
+                                Debug("end: endTime: $endTime runSecs: $runSecs") if ($debug);
+                        }
+
+                        $complete = 1;
+		}
+	}
+
+	my $fa = "ARRAY[" . join(',', @fss) . "]::fs_entry[]";
+	my $wa = "ARRAY[" . join(',', @waiters) . "]::waiter_entry[]";
+	my $ea = "ARRAY[" . join(',', @errors) . "]::text[]";
+	if ($debug) {
+		Debug("fa: $fa");
+		Debug("wa: $wa");
+		Debug("ea: $ea");
+	}
+
+	return unless ($doDBInsert);
+	eval {
+		MonitorDB::Entry::Insert($dbh, $endTime, $runSecs, $hid, $state, $verbsEnabled,
+			$verbsPorts, $fa, $wa, $ea, $complete, $mountsOk);
+	};
+	Warning($@) if ($@);
+}
+
+################################################################################
+#
+# MAIN ROUTINE
+#
+################################################################################
+
+my $loggerProto = getprotobyname($monitorProtocol);
+unless ($loggerProto) {
+        Fatal(EXIT_BADOPT, "unable to determine protocol number for monitor-protocol '$monitorProtocol'");
+}
+
+my $lPort;
+if ($listenerPort =~ /^\d+$/) {
+        $lPort = $listenerPort;
+
+} else {
+        $lPort = getservbyname($listenerPort, $monitorProtocol);
+        unless ($lPort) {
+                Fatal(EXIT_BADOPT, "unable to determine port number for listener-port '$listenerPort'");
+        }
+}
+
+Debug("doDBInsert: $doDBInsert");
+Debug("listenerPort: $listenerPort (" . $lPort . ")");
+Debug("maxTimeSkew: $maxTimeSkew");
+
+my $sock;
+my $listenerSin = sockaddr_in($lPort, INADDR_ANY);
+socket($sock, PF_INET, SOCK_DGRAM, $loggerProto) || Fatal("listener socket: $!");
+setsockopt($sock, SOL_SOCKET, SO_REUSEADDR, 1);
+bind($sock, $listenerSin) || Fatal("bind listener port $listenerPort: $!");
+
+LockoutPreDaemonize($lockFile) if ($lockout);
+
+if (!$debug) {
+        my $pid = fork;
+        die "fork failed: $!\n" if (!defined($pid));
+        exit(0) if ($pid > 0);
+        POSIX::setsid;
+	open STDOUT, ">$logFile" || die "Could not open output file '$logFile'\n";
+	open STDERR, ">&STDOUT";
+        close STDIN;
+}
+
+LockoutPostDaemonize if ($lockout);
+
+# If postgresql is not started, start it
+my $pg_ctl = '/usr/local/pgsql92/bin/pg_ctl';
+my $pg_data = '/usr/local/pgsql92/data/';
+my $pgsql_status = `su - postgres -c '$pg_ctl -D $pg_data status'`;
+if ($pgsql_status =~ /.*no\sserver\srunning.*/) {
+    `su - postgres -c '$pg_ctl -D $pg_data -l logfile start'`;
+    sleep 3;
+}
+
+my $dbh = MonitorDB::Connect($dbHost, $dbPort, $dbName, $dbUser, $dbPassword);
+my $msg;
+my $senderPort;
+my $senderAddr;
+
+my $running = 1;
+$SIG{HUP} = sub { $running = 0; };
+
+while ($running) {
+	my $senderSin = recv($sock, $msg, $maxMsgLen, 0);
+	if (!defined($senderSin)) {
+		Debug("recv error: $!");
+		next;
+	}
+
+	($senderPort, $senderAddr) = unpack_sockaddr_in($senderSin);
+	my $sa = inet_ntoa($senderAddr);
+        if ($debug) {
+                Debug("received " . length($msg) . " bytes from " . $sa);
+                Debug($msg);
+        }
+
+	ProcessMsg($dbh, $msg, $sa);
+}
+
+MonitorDB::Finish($dbh);
+exit(EXIT_SUCCESS);
+
+=encoding utf8
+
+=head1 NAME
+
+gpfsmonitor - GPFS Monitoring Suite status message collection daemon
+
+=head1 SYNOPSIS
+
+B<gpfsmonitor> [options]
+
+=head1 DESCRIPTION
+
+B<gpfsmonitor> is the component of the GPFS Monitoring Suite that collects
+and stores client status messages received from the gpfsmond daemons
+running on GPFS client nodes.
+
+=head1 OPTIONS
+
+=over 4
+
+=item B<--config> F<path>
+
+Define the configuration file path name (default F</etc/gpfsmonitor.conf>).
+
+=item B<--db-host> I<host-name|IP-address>
+
+Define the database connection host name or IP address (default I<localhost>).
+
+=item B<--db-name> I<database-name>
+
+Define the database name (default I<gpfsmonitor>).
+
+=item B<--db-password> I<password>
+
+Define the data base access user password (default is no password).
+
+=item B<--db-port> I<service-name|port>
+
+Define the database connection port number (default the DBI driver's default value).
+
+=item B<--db-user> I<user-name>
+
+Define the data base access user name (default is I<gpfsmonitor>).
+
+=item B<--debug>
+
+Enable debug output.
+
+=item B<--dev-whitelist> I<regex>
+
+Supply a regular expression to be compiled and applied as the GPFS device name whitelist
+for filtering the file system entries from clients.  This is useful if some clients are
+also mounting foreign GPFS file systems you do not wish to monitor.
+
+=item B<--help>
+
+Display a brief help message and exit.
+
+=item B<--insert>
+
+Enable status message data base inserts (default).
+
+=item B<--listener-port> I<service-name|port>
+
+Define the UDP port number on which B<gpfsmonitor> listens for status messages
+(default I<gpfsmonitor>).
+
+=item B<--lock> F<path>
+
+Define the path to the daemon lockout file (default F</var/run/gpfsmonitor>).
+
+=item B<--lockout>
+
+Enable the daemon lockout check (default).  When enabled, gpfsmonitor attempts to
+determine if another copy is currently running, and exits if one is found.
+
+=item B<--log> F<path>
+
+Define the path to the log file (default F</var/log/gpfsmonitor>).
+
+=item B<--man>
+
+Display the manual page and exit.
+
+=item B<--max-msg-len> I<n>
+
+Define the maximum sized status message to accept (default I<8192>).
+
+=item B<--max-time-skew> I<n>
+
+Define the maximum time skew from this system's time for acceptable status messages,
+in seconds (default I<600>).
+
+=item B<--noinsert>
+
+Disable status message data base inserts.
+
+=item B<--nolockout>
+
+Disable the daemon lockout check.
+
+=item B<--version>
+
+Display the gpfsmonitor script version and exit.
+
+=back
+
+=head1 CONFIGURATION PARAMETERS
+
+=over 4
+
+=item C<$dbHost>
+
+See the description of the B<--db-host> option.
+
+=item C<$dbPort>
+
+See the description of the B<--db-port> option.
+
+=item C<$dbPassword>
+
+See the description of the B<--db-password> option.
+
+=item C<$dbUser>
+
+See the description of the B<--db-user> option.
+
+=item C<$devWhiteList>
+
+See the description of the B<--dev-whitelist> option.
+
+=item C<$doDBInsert>
+
+See the description of the B<--insert> option.
+
+=item C<$listenerPort>
+
+See the description of the B<--listener-port> option.
+
+=item C<$lockFile>
+
+See the description of the B<--lock> option.
+
+=item C<$lockout>
+
+See the description of the B<--lockout> option.
+
+=item C<$logFile>
+
+See the description of the B<--log> option.
+
+=item C<$maxMsgLen>
+
+See the description of the B<--max-msg-len> option.
+
+=item C<$maxTimeSkew>
+
+See the description of the B<--max-time-skew> option.
+
+=back
+
+=head1 RETURN CODES
+
+=over 4
+
+=item C<0>
+
+Success.
+
+=item C<1>
+
+A failure was detected.
+
+=item C<2>
+
+A bad option argument was provided or was missing.
+
+=item C<3>
+
+The configuration file had a parse or syntax error.
+
+=back
+
+=head1 SIGNALS
+
+When SIGHUP is received, B<gpfsmonitor> will exit.  
+
+=cut
