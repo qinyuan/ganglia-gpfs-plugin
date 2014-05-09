@@ -479,6 +479,45 @@ sub RegisterClusterPseudoIP (@)
         }
 }
 
+sub read_file($) {
+    my $file_name = shift;
+    my $fh;
+    my $content;
+    unless( -e $file_name) {
+        return '';
+    }
+    open $fh, '<', $file_name;
+    while (my $line = <$fh> ) {
+        $content .= $line;
+    }
+    $content;
+}
+
+sub write_file($$) {                                        
+    my $file_name = shift;
+    my $content = shift;
+    my $file_handle;
+    open $file_handle, '>', $file_name;
+    print $file_handle $content;
+    close $file_handle;
+}
+
+sub append_clusters($$) {
+    my $c_name = shift;
+    my $c_ip = shift;
+    my $gpfsreporter_conf = read_file($defaultConfigFile);
+    my @gpfsreporter_conf_arr = split(/;/, $gpfsreporter_conf);
+    my $new_conf = '';
+    for (@gpfsreporter_conf_arr) {
+        if ($_ =~ /^\s*RegisterClusterPseudoIP\(.*/) {
+            my $str = "'$c_name'\t\t=> '$c_ip',\n";
+            $_ =~ s/\)/\t$str\)/g;
+        }
+        $new_conf .= "$_;" unless($_ =~ /^\s+$/);
+    }
+    write_file($defaultConfigFile, $new_conf);
+}
+
 sub SpoofHost ($)
 {
 	my $c = shift;
@@ -497,6 +536,7 @@ sub SpoofHost ($)
         $sth -> bind_columns(\$addr);
         if ($sth -> fetch()) {
             $a = $addr;
+            append_clusters($c, $a);
         }
     }
 

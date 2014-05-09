@@ -97,6 +97,7 @@ function get_hosts_by_ip($search_ip) {
  */
 function get_gpfs_clusters() {
     $gpfsreporter_conf = file_get_contents('/etc/gpfsreporter.conf');
+    $gpfsreporter_conf = preg_replace("/\#[^\n]*\n/", "", $gpfsreporter_conf);
     $start = strpos($gpfsreporter_conf, 'RegisterClusterPseudoIP');
     $end = strpos($gpfsreporter_conf, ');', $start);
     $gpfs_clusters_str = substr($gpfsreporter_conf, $start, $end - $start);
@@ -242,8 +243,19 @@ function get_gpfs_cluster_host($cluster_name) {
     return null;
 }
 
+function clear_gpfs_state_views() {
+    $dir = get_gweb_config_dir();
+    $files = scandir($dir);
+    foreach ($files as $file) {
+        if (preg_match("/^view_.*_state.json$/", $file)) {
+            unlink($dir . $file);
+        }
+    }
+}
+
 function config_gpfs_state_view($gpfs_cluster_name = null) {
     if ($gpfs_cluster_name == null) {
+        clear_gpfs_state_views();
         $gpfs_clusters = get_gpfs_clusters();
         foreach (array_keys($gpfs_clusters) as $key) {
             config_gpfs_state_view($key);
