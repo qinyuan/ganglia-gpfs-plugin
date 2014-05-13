@@ -30,7 +30,8 @@ div.clusterChart div.label{
 
 div.hostsChart {
   background-color: #cceeff;
-  padding: 20px;
+  padding: 5px 10px;
+  line-height: 50px;
 }
 
 span.host {
