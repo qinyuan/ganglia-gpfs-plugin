@@ -1,0 +1,46 @@
+#!/bin/sh
+#
+# chkconfig: 35 40 93
+# description: postgresql9.2 startup script
+# 
+
+. /etc/rc.d/init.d/functions
+
+RETVAL=0
+
+case "$1" in
+   start)
+      echo -n "Starting PostgreSQL 92: "
+      command='su - postgres -c "/usr/local/pgsql92/bin/pg_ctl -D /usr/local/pgsql92/data -l logfile start"'
+      daemon $command
+
+      RETVAL=$?
+      echo
+      [ $RETVAL -eq 0 ] && touch /var/lock/subsys/postgresql92
+      ;;
+
+  stop)
+      echo -n "Shutting down PostgreSQL 92: "
+      command='su - postgres -c "/usr/local/pgsql92/bin/pg_ctl -D /usr/local/pgsql92/data -l logfile stop"'
+      daemon $command
+      
+      RETVAL=$?
+      echo
+      [ $RETVAL -eq 0 ] && rm -f /var/lock/subsys/postgresql92
+      ;;
+
+  restart|reload)
+      $0 stop
+      $0 start
+      RETVAL=$?
+      ;;
+  status)
+      su - postgres -c "/usr/local/pgsql92/bin/pg_ctl -D /usr/local/pgsql92/data status"
+      RETVAL=$?
+      ;;
+  *)
+      echo "Usage: $0 {start|stop|restart|status}"
+      exit 1
+esac
+
+exit $RETVAL
