@@ -105,13 +105,32 @@ function fetch_table($table_name, $fields = null, $where_clause = "") {
     return $rows;
 }
 
+function my_str_cmp($a, $b) {
+    $a_str_part = preg_replace("/\d/", '', $a);
+    $a_num_part = preg_replace("/\D/", '', $a);
+    $b_str_part = preg_replace("/\d/", '', $b);
+    $b_num_part = preg_replace("/\D/", '', $b);
+
+    return $a_str_part === $b_str_part ? 
+        intval($a_num_part) - intval($b_num_part) : 
+        strcmp($a_str_part, $b_str_part);
+}
+
+function sort_name($a, $b) {
+    return my_str_cmp($a['name'], $b['name']);
+}
+
 function get_clusters() {
-    return fetch_table("clusters");
+    $clusters = fetch_table("clusters");
+    uasort($clusters, 'sort_name');
+    return $clusters;
 }
 
 function get_hosts() {
     $fields = array('id', 'name', 'cluster_id');
-    return fetch_table("hosts", $fields, "where cluster_id>0");
+    $hosts = fetch_table("hosts", $fields, "where cluster_id>0");
+    uasort($hosts, 'sort_name');
+    return $hosts;
 }
 
 function get_state_colors() {
@@ -161,6 +180,10 @@ function parse_fs_mounted_states($str) {
         );
     }
     return $fs_mounted_states;
+}
+
+function sort_fs_hosts($a, $b) {
+    return my_str_cmp($a['host_name'], $b['host_name']);
 }
 
 /**
@@ -224,6 +247,12 @@ function get_filesystems() {
                 'host_name' => $row['host_name'],
                 'color' => $mount_colors[$mounted_state]['code'],
             );
+        }
+    }
+
+    foreach (array_keys($filesystems) as $cluster_id) {
+        foreach ($filesystems[$cluster_id] as $fs_id => $filesystem) {
+            uasort($filesystems[$cluster_id][$fs_id]['hosts'], 'sort_fs_hosts');
         }
     }
     return $filesystems;

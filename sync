@@ -1,4 +1,0 @@
-#!/bin/sh
-
-scp conf.php root@min:/var/www/html/gweb/
-#scp conf.php root@rh8:/var/www/html/gweb/
