@@ -1,44 +1,69 @@
 <?php
-$conf_dir = '/var/www/html/gmonitor/conf/';
+function get_modules() {
+    $modules = array();
+    $links_dir = dirname(__FILE__) . '/conf/links/';
+    $files = scandir($links_dir);
+    foreach ($files as $file) {
+        if (preg_match("/^.*\.json$/", $file)) {
+            $link = json_decode(file_get_contents($links_dir . $file));
+            add_link($modules, $link);
+        }
+    }
+    return $modules;
+}
 
-function get_modules_json() {
-    global $conf_dir;
-    $modules_conf_file = $conf_dir . 'modules.json';
-    $modules_json = json_decode(file_get_contents($modules_conf_file));
-    return $modules_json;
+function add_link(&$modules, $link) {
+    for ($i=0, $len = count($modules); $i < $len; $i++) {
+        if ($modules[$i]['name'] === $link -> group) {
+            $modules[$i]['links'][] = array(
+                'href' => $link -> href,
+                'text' => $link -> title,
+            );
+            return;
+        }
+    }
+
+    $modules[] = array(
+        'name' => $link -> group,
+        'links' => array(
+            array(
+                'href' => $link -> href,
+                'text' => $link -> title,
+            ),
+        ),
+    );
 }
 
 function get_navi_tree_json() {
-    $modules_json = get_modules_json();
+    $modules = get_modules();
     $menu = array();
     $id = 1;
-    foreach ($modules_json as $module_json) {
-        $module = array(
-            "text" => $module_json -> name,
-            'iconCls' => 'icon-module',
-            "state" => "open",
-            "children" => array()
-        );
-        $links = $module_json -> links;
-        foreach ($links as $link) {
-            $module['children'][] = array(
+    foreach ($modules as $module) {
+        $children = array();
+        foreach ($module['links'] as $link) {
+            $children[] = array(
                 'id' => $id++,
-                'text' => $link -> text,
+                'text' => $link['text'],
             );
         }
-        $menu[] = $module;
+        $menu[] = array(
+            "text" => $module['name'],
+            'iconCls' => 'icon-module',
+            "state" => "open",
+            "children" => $children
+        );
     }
     return $menu;
 }
 
 function get_href_by_id($id) {
-    $modules_json = get_modules_json();
+    $modules = get_modules();
     $i=1;
-    foreach ($modules_json as $module_json) {
-        $links = $module_json -> links;
+    foreach ($modules as $module) {
+        $links = $module['links'];
         foreach ($links as $link) {
             if ($id === $i) {
-                return $link -> href;
+                return $link['href'];
             }
             $i++;
         }
