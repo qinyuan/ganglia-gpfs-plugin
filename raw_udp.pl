@@ -71,7 +71,7 @@ sub send_packet($$) {
 }
 
 unless ($ARGV[0]) {
-    print "Usage: $0 <destination ip>\n";
+    print "Usage: $0 DESTINATION_IP\n";
     exit 1;
 }
 sub main {

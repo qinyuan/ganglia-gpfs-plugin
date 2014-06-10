@@ -1,0 +1,47 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+
+my %metrics = (
+    'gpfs_io_rps_vfs1' => 0,
+    'gpfs_io_wps_vfs1' => 0,
+    'bytes_in' => 0,
+    'bytes_out' => 0,
+    'cpu_aidle' => 10,
+    'cpu_idle' => 10,
+    'cpu_intr' => 10,
+    'cpu_nice' => 10,
+    'cpu_num' => 2,
+    'cpu_sintr' => 2,
+    'cpu_speed' => 1000,
+    'cpu_steal' => 0,
+    'cpu_system' => 1,
+    'cpu_user' => 1,
+    'cpu_wio' => 0.1,
+    'load_fifteen' => 0.5,
+    'load_five' => 0.5,
+    'load_one' => 0.5,
+    'mem_buffers' => 100000,
+    'mem_cached' => 100000,
+    'mem_dirty' => 100000,
+    'mem_free' => 100000,
+    'mem_hardware_corrupted' => 0,
+    'mem_mapped' => 0,
+    'mem_shared' => 0,
+    'mem_total' => 400000,
+    'mem_writeback' => 0,
+    'swap_free' => 100000,
+    'swap_total' => 200000,
+);
+
+while(1) {
+    for my $host_num (1..20) {
+        my $host = "vhost$host_num";
+        my $addr = "192.168.9.1$host_num";
+        while (my ($metric_name, $metric_value) = each(%metrics)) {
+            `gmetric -n '$metric_name' -v '$metric_value' -t float -S "$addr:$host"`;
+        }
+    }
+    sleep 20;
+}

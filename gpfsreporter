@@ -536,6 +536,7 @@ sub SpoofHost ($)
         $sth -> bind_columns(\$addr);
         if ($sth -> fetch()) {
             $a = $addr;
+            $pseudoIPAddr{$c} = $a;
             append_clusters($c, $a);
         }
     }
